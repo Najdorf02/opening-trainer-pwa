@@ -1,0 +1,45 @@
+[Event "Sample study"]
+[Site "https://lichess.org/study/sampleW1a/qgdmain1"]
+[Date "2026.08.25"]
+[Round "-"]
+[White "?"]
+[Black "?"]
+[Result "*"]
+[StudyName "샘플 · 퀸스 갬빗"]
+[ChapterName "정통 퀸스 갬빗"]
+[ChapterURL "https://lichess.org/study/sampleW1a/qgdmain1"]
+[Orientation "white"]
+
+1. d4 d5 2. c4 e6 (2... c6 3. Nf3 Nf6 4. e3) 3. Nc3 Nf6 4. Bg5 Be7
+5. e3 O-O 6. Nf3 *
+
+[Event "Sample study"]
+[Site "https://lichess.org/study/sampleW1a/slavline"]
+[Date "2026.08.25"]
+[Round "-"]
+[White "?"]
+[Black "?"]
+[Result "*"]
+[StudyName "샘플 · 퀸스 갬빗"]
+[ChapterName "슬라브 메인 라인"]
+[ChapterURL "https://lichess.org/study/sampleW1a/slavline"]
+[Orientation "white"]
+
+1. d4 d5 2. c4 c6 3. Nf3 Nf6 4. Nc3 dxc4 5. a4 Bf5 6. e3 e6
+7. Bxc4 {중앙을 되찾고 캐슬링을 준비합니다. [%cal Gc1g5]} Bb4 8. O-O *
+
+[Event "Sample study"]
+[Site "https://lichess.org/study/sampleB1a/najdorf1"]
+[Date "2026.08.25"]
+[Round "-"]
+[White "?"]
+[Black "?"]
+[Result "*"]
+[StudyName "샘플 · 나이도프 시실리안"]
+[ChapterName "오픈 시실리안 진입"]
+[ChapterURL "https://lichess.org/study/sampleB1a/najdorf1"]
+[Orientation "black"]
+
+1. e4 c5 2. Nf3 (2. Nc3 Nc6 3. Nf3 d6) d6 3. d4 cxd4 4. Nxd4 Nf6
+5. Nc3 a6 {나이도프의 시작 포지션입니다. [%csl Ya6] [%cal Gb7b5]} 6. Be3 e5
+(6... e6 7. f3 b5) 7. Nf3 Be7 *

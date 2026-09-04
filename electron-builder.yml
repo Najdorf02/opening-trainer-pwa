@@ -1,0 +1,24 @@
+appId: com.saturdaycthuns.openingtrainer
+productName: Opening Trainer
+asar: true
+npmRebuild: false
+compression: normal
+directories:
+  app: dist-electron/app
+  output: release
+files:
+  - '!**/*'
+  - main.cjs
+  - package.json
+extraResources:
+  - from: dist
+    to: web
+    filter:
+      - '**/*'
+win:
+  target:
+    - target: portable
+      arch:
+        - x64
+  artifactName: Opening-Trainer.exe
+  signAndEditExecutable: false
