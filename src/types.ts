@@ -87,6 +87,8 @@ export interface OpeningEvaluationMove {
   uci: string;
   san?: string;
   score: EvaluationScore;
+  /** Principal variation from this candidate, when supplied by the local engine. */
+  pv?: string[];
 }
 
 export type OpeningMoveEvaluation =
@@ -95,7 +97,7 @@ export type OpeningMoveEvaluation =
       verdict: 'pass' | 'fail';
       passed: boolean;
       reason: 'engine-within-threshold' | 'engine-loss-too-large' | 'engine-forced-mate-lost';
-      move: { uci: string; san: string };
+      move: { uci: string; san: string; pv?: string[] };
       centipawnLoss: number;
       thresholdCp: number;
       depth: number;

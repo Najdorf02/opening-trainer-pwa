@@ -114,6 +114,41 @@ export interface GameReviewTrainingPosition {
   matchingChapters: RepertoireChapterRef[];
 }
 
+export interface GameReviewTrainingOccurrence {
+  gameId: string;
+  gameUrl?: string;
+  playedAt?: string;
+  playedMove: Pick<ReviewedGameMove, "uci" | "san">;
+  reason: Extract<GameDeviationReason, "move-not-covered" | "known-avoid">;
+}
+
+/**
+ * One persistable review item, grouped by the position rather than by game.
+ * Only genuine user deviations can produce this payload.
+ */
+export interface GameReviewTrainingAggregate {
+  source: "chesscom-review";
+  positionKey: string;
+  fen: string;
+  userColor: RepertoireColor;
+  correctMoves: RepertoireReviewMoveCandidate[];
+  matchingChapters: RepertoireChapterRef[];
+  occurrences: GameReviewTrainingOccurrence[];
+  occurrenceCount: number;
+}
+
+export interface GameReviewDrillResult {
+  source: "chesscom-review";
+  positionKey: string;
+  gameId: string;
+  /** Full position context lets the caller persist or grade the matching SRS cards. */
+  trainingPosition: GameReviewTrainingAggregate;
+  correctMove: Pick<RepertoireReviewMoveCandidate, "moveId" | "cardId" | "uci" | "san">;
+  wrongAttempts: number;
+  firstTryCorrect: boolean;
+  completedAt: string;
+}
+
 export type GameRepertoireReviewStatus =
   | "in-repertoire"
   | "user-deviation"
@@ -587,4 +622,102 @@ export function reviewGameAgainstRepertoire(
     match: matchingChapters[0],
     matchingChapters,
   };
+}
+
+function mergeChapterRefs(
+  target: RepertoireChapterRef[],
+  incoming: readonly RepertoireChapterRef[],
+): void {
+  for (const chapter of incoming) {
+    if (!target.some(
+      (current) => current.studyId === chapter.studyId && current.chapterId === chapter.chapterId,
+    )) {
+      target.push({ ...chapter });
+    }
+  }
+}
+
+function mergeTrainingCandidates(
+  target: RepertoireReviewMoveCandidate[],
+  incoming: readonly RepertoireReviewMoveCandidate[],
+): void {
+  for (const candidate of incoming) {
+    const current = target.find((move) => move.uci === candidate.uci);
+    if (!current) {
+      target.push({
+        ...candidate,
+        annotations: cloneAnnotations(candidate.annotations),
+        chapters: candidate.chapters.map((chapter) => ({ ...chapter })),
+      });
+      continue;
+    }
+    mergeAnnotations(current.annotations, candidate.annotations);
+    mergeChapterRefs(current.chapters, candidate.chapters);
+  }
+}
+
+/**
+ * Group repeated Chess.com user deviations into stable position-level review
+ * items. Opponent novelties and positions where the repertoire has ended are
+ * deliberately excluded, because neither represents a user lapse.
+ */
+export function aggregateGameReviewTrainingPositions(
+  reviews: readonly GameRepertoireReview[],
+): GameReviewTrainingAggregate[] {
+  const grouped = new Map<string, GameReviewTrainingAggregate>();
+
+  for (const review of reviews) {
+    const position = review.reviewPosition;
+    const deviation = review.firstUserDeviation;
+    if (
+      review.status !== "user-deviation" ||
+      !position ||
+      !deviation ||
+      (deviation.reason !== "move-not-covered" && deviation.reason !== "known-avoid")
+    ) {
+      continue;
+    }
+
+    const occurrence: GameReviewTrainingOccurrence = {
+      gameId: review.meta.id,
+      ...(review.meta.url ? { gameUrl: review.meta.url } : {}),
+      ...(review.meta.playedAt ? { playedAt: review.meta.playedAt } : {}),
+      playedMove: { uci: position.played.uci, san: position.played.san },
+      reason: deviation.reason,
+    };
+    const current = grouped.get(position.positionKey);
+    if (current) {
+      if (!current.occurrences.some((item) => item.gameId === occurrence.gameId)) {
+        current.occurrences.push(occurrence);
+        current.occurrenceCount = current.occurrences.length;
+      }
+      mergeTrainingCandidates(current.correctMoves, position.correctMoves);
+      mergeChapterRefs(current.matchingChapters, position.matchingChapters);
+      continue;
+    }
+
+    grouped.set(position.positionKey, {
+      source: "chesscom-review",
+      positionKey: position.positionKey,
+      fen: position.fen,
+      userColor: review.meta.userColor,
+      correctMoves: [],
+      matchingChapters: position.matchingChapters.map((chapter) => ({ ...chapter })),
+      occurrences: [occurrence],
+      occurrenceCount: 1,
+    });
+    mergeTrainingCandidates(
+      grouped.get(position.positionKey)!.correctMoves,
+      position.correctMoves,
+    );
+  }
+
+  return [...grouped.values()].sort((left, right) => {
+    if (left.occurrenceCount !== right.occurrenceCount) {
+      return right.occurrenceCount - left.occurrenceCount;
+    }
+    const leftDate = left.occurrences.at(-1)?.playedAt ?? "";
+    const rightDate = right.occurrences.at(-1)?.playedAt ?? "";
+    return rightDate.localeCompare(leftDate) || left.positionKey.localeCompare(right.positionKey);
+  });
 }

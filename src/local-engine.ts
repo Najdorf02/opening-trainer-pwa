@@ -214,6 +214,7 @@ export class LocalStockfishEngine {
         uci: line.pv[0],
         san: sanFor(move.fen, line.pv[0]),
         score: line.score,
+        pv: [...line.pv],
       }));
 
       return {
@@ -223,7 +224,7 @@ export class LocalStockfishEngine {
         reason: forcedMateLost
           ? 'engine-forced-mate-lost'
           : passed ? 'engine-within-threshold' : 'engine-loss-too-large',
-        move: { uci: move.uci, san: move.san },
+        move: { uci: move.uci, san: move.san, pv: [...played.pv] },
         centipawnLoss: loss,
         thresholdCp: maxCpl,
         depth: Math.min(best.depth, played.depth),

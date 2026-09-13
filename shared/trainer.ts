@@ -124,6 +124,327 @@ export interface SessionCardGrade {
 
 interface GradeAccumulator extends SessionCardGrade {}
 
+export const TRAINER_SESSION_VERSION = 1 as const;
+
+export type TrainerSessionRestoreErrorCode =
+  | "INVALID_SNAPSHOT"
+  | "UNSUPPORTED_VERSION"
+  | "CHAPTER_MISMATCH"
+  | "STALE_CHAPTER";
+
+/**
+ * A JSON-safe checkpoint of all state that affects a chapter session.
+ * `promptElapsedMs` preserves active thinking time without counting the time
+ * between closing and reopening the app.
+ */
+export interface SerializedTrainerSessionV1 {
+  version: typeof TRAINER_SESSION_VERSION;
+  savedAt: number;
+  chapterId: string;
+  chapterRevision: string;
+  state: {
+    phase: TrainingPhase;
+    status: TrainerStatus;
+    currentNodeId: string;
+    scheduledLineId?: string;
+    routeLineId?: string;
+    actualMoveIds: string[];
+    pendingInitialLineIds: string[];
+    dirtyLineOrder: string[];
+    reviewQueue: string[];
+    trialHadError: boolean;
+    trialHadAlternative: boolean;
+    promptHadError: boolean;
+    promptElapsedMs: number;
+    /** Only the played move is persisted; correction data is rebuilt safely. */
+    correctionPlayedUci?: string;
+    attempts: TrainerAttempt[];
+    grades: SessionCardGrade[];
+  };
+}
+
+export type SerializedTrainerSession = SerializedTrainerSessionV1;
+
+export class TrainerSessionRestoreError extends Error {
+  readonly code: TrainerSessionRestoreErrorCode;
+
+  constructor(code: TrainerSessionRestoreErrorCode, message: string) {
+    super(message);
+    this.name = "TrainerSessionRestoreError";
+    this.code = code;
+  }
+}
+
+type UnknownRecord = Record<string, unknown>;
+
+function restoreError(
+  code: TrainerSessionRestoreErrorCode,
+  message: string,
+): never {
+  throw new TrainerSessionRestoreError(code, message);
+}
+
+function asRecord(value: unknown, field: string): UnknownRecord {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    restoreError("INVALID_SNAPSHOT", `${field} must be an object.`);
+  }
+  return value as UnknownRecord;
+}
+
+function asString(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    restoreError("INVALID_SNAPSHOT", `${field} must be a string.`);
+  }
+  return value;
+}
+
+function asOptionalString(value: unknown, field: string): string | undefined {
+  if (value === undefined) return undefined;
+  return asString(value, field);
+}
+
+function asBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") {
+    restoreError("INVALID_SNAPSHOT", `${field} must be a boolean.`);
+  }
+  return value;
+}
+
+function asNonNegativeNumber(value: unknown, field: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    restoreError(
+      "INVALID_SNAPSHOT",
+      `${field} must be a finite non-negative number.`,
+    );
+  }
+  return value;
+}
+
+function asStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) {
+    restoreError("INVALID_SNAPSHOT", `${field} must be an array.`);
+  }
+  return value.map((item, index) => asString(item, `${field}[${index}]`));
+}
+
+function asEnum<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  field: string,
+): T {
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    restoreError("INVALID_SNAPSHOT", `${field} has an invalid value.`);
+  }
+  return value as T;
+}
+
+function parseAttempt(value: unknown, index: number): TrainerAttempt {
+  const field = `state.attempts[${index}]`;
+  const record = asRecord(value, field);
+  return {
+    chapterId: asString(record.chapterId, `${field}.chapterId`),
+    phase: asEnum(
+      record.phase,
+      ["initial", "mistake-review"] as const,
+      `${field}.phase`,
+    ),
+    scheduledLineId: asString(
+      record.scheduledLineId,
+      `${field}.scheduledLineId`,
+    ),
+    routeLineId: asString(record.routeLineId, `${field}.routeLineId`),
+    nodeId: asString(record.nodeId, `${field}.nodeId`),
+    positionKey: asString(record.positionKey, `${field}.positionKey`),
+    targetCardId: asOptionalString(
+      record.targetCardId,
+      `${field}.targetCardId`,
+    ),
+    playedCardId: asOptionalString(
+      record.playedCardId,
+      `${field}.playedCardId`,
+    ),
+    playedUci: asString(record.playedUci, `${field}.playedUci`),
+    outcome: asEnum(
+      record.outcome,
+      [
+        "target-correct",
+        "repertoire-alternative",
+        "known-avoid",
+        "incorrect",
+        "illegal",
+      ] as const,
+      `${field}.outcome`,
+    ),
+    elapsedMs: asNonNegativeNumber(record.elapsedMs, `${field}.elapsedMs`),
+    occurredAt: asNonNegativeNumber(record.occurredAt, `${field}.occurredAt`),
+  };
+}
+
+function parseGrade(value: unknown, index: number): SessionCardGrade {
+  const field = `state.grades[${index}]`;
+  const record = asRecord(value, field);
+  return {
+    cardId: asString(record.cardId, `${field}.cardId`),
+    grade: asEnum(record.grade, ["again", "good"] as const, `${field}.grade`),
+    firstAttemptAt: asNonNegativeNumber(
+      record.firstAttemptAt,
+      `${field}.firstAttemptAt`,
+    ),
+    lastAttemptAt: asNonNegativeNumber(
+      record.lastAttemptAt,
+      `${field}.lastAttemptAt`,
+    ),
+    totalResponseMs: asNonNegativeNumber(
+      record.totalResponseMs,
+      `${field}.totalResponseMs`,
+    ),
+  };
+}
+
+function parseSerializedSession(value: unknown): SerializedTrainerSessionV1 {
+  let decoded = value;
+  if (typeof decoded === "string") {
+    try {
+      decoded = JSON.parse(decoded) as unknown;
+    } catch {
+      restoreError("INVALID_SNAPSHOT", "The trainer checkpoint is not valid JSON.");
+    }
+  }
+
+  const record = asRecord(decoded, "checkpoint");
+  if (record.version !== TRAINER_SESSION_VERSION) {
+    if (typeof record.version === "number") {
+      restoreError(
+        "UNSUPPORTED_VERSION",
+        `Trainer checkpoint version ${record.version} is not supported.`,
+      );
+    }
+    restoreError("INVALID_SNAPSHOT", "Trainer checkpoint version is missing.");
+  }
+
+  const state = asRecord(record.state, "state");
+  if (!Array.isArray(state.attempts) || !Array.isArray(state.grades)) {
+    restoreError("INVALID_SNAPSHOT", "Trainer history must be stored as arrays.");
+  }
+
+  return {
+    version: TRAINER_SESSION_VERSION,
+    savedAt: asNonNegativeNumber(record.savedAt, "savedAt"),
+    chapterId: asString(record.chapterId, "chapterId"),
+    chapterRevision: asString(record.chapterRevision, "chapterRevision"),
+    state: {
+      phase: asEnum(
+        state.phase,
+        ["initial", "mistake-review", "complete"] as const,
+        "state.phase",
+      ),
+      status: asEnum(
+        state.status,
+        [
+          "idle",
+          "awaiting-user",
+          "showing-correction",
+          "line-complete",
+          "complete",
+        ] as const,
+        "state.status",
+      ),
+      currentNodeId: asString(state.currentNodeId, "state.currentNodeId"),
+      scheduledLineId: asOptionalString(
+        state.scheduledLineId,
+        "state.scheduledLineId",
+      ),
+      routeLineId: asOptionalString(state.routeLineId, "state.routeLineId"),
+      actualMoveIds: asStringArray(state.actualMoveIds, "state.actualMoveIds"),
+      pendingInitialLineIds: asStringArray(
+        state.pendingInitialLineIds,
+        "state.pendingInitialLineIds",
+      ),
+      dirtyLineOrder: asStringArray(
+        state.dirtyLineOrder,
+        "state.dirtyLineOrder",
+      ),
+      reviewQueue: asStringArray(state.reviewQueue, "state.reviewQueue"),
+      trialHadError: asBoolean(
+        state.trialHadError,
+        "state.trialHadError",
+      ),
+      trialHadAlternative: asBoolean(
+        state.trialHadAlternative,
+        "state.trialHadAlternative",
+      ),
+      promptHadError: asBoolean(
+        state.promptHadError,
+        "state.promptHadError",
+      ),
+      promptElapsedMs: asNonNegativeNumber(
+        state.promptElapsedMs,
+        "state.promptElapsedMs",
+      ),
+      correctionPlayedUci: asOptionalString(
+        state.correctionPlayedUci,
+        "state.correctionPlayedUci",
+      ),
+      attempts: state.attempts.map(parseAttempt),
+      grades: state.grades.map(parseGrade),
+    },
+  };
+}
+
+/** A compact structural fingerprint; comments and names do not invalidate it. */
+export function trainerChapterRevision(chapter: RepertoireChapter): string {
+  const structure = JSON.stringify({
+    variant: chapter.variant,
+    repertoireColor: chapter.repertoireColor,
+    rootFen: chapter.rootFen,
+    rootNodeId: chapter.rootNodeId,
+    positions: Object.keys(chapter.positions)
+      .sort()
+      .map((id) => {
+        const position = chapter.positions[id];
+        return [
+          id,
+          position.fen,
+          position.positionKey,
+          position.turn,
+          position.outgoingMoveIds,
+        ];
+      }),
+    moves: Object.keys(chapter.moves)
+      .sort()
+      .map((id) => {
+        const move = chapter.moves[id];
+        return [
+          id,
+          move.fromNodeId,
+          move.toNodeId,
+          move.uci,
+          move.order,
+          move.trainingRole,
+          move.cardId ?? null,
+        ];
+      }),
+    lines: chapter.lines.map((line) => [
+      line.id,
+      line.moveIds,
+      line.userCardIds,
+      line.order,
+    ]),
+  });
+
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (let index = 0; index < structure.length; index += 1) {
+    const codeUnit = structure.charCodeAt(index);
+    hash ^= BigInt(codeUnit & 0xff);
+    hash = (hash * prime) & mask;
+    hash ^= BigInt(codeUnit >>> 8);
+    hash = (hash * prime) & mask;
+  }
+  return `trainer-v1:${structure.length}:${hash.toString(16).padStart(16, "0")}`;
+}
+
 function isPrefix(prefix: string[], full: string[]): boolean {
   return prefix.every((moveId, index) => full[index] === moveId);
 }
@@ -135,6 +456,7 @@ function inputToUci(input: UserMoveInput): string {
 
 export class ChapterTrainer {
   private readonly chapter: RepertoireChapter;
+  private readonly chapterRevision: string;
   private readonly linesById: Map<string, TrainingLine>;
   private readonly pendingInitial: Set<string>;
   private readonly dirtyLineIds = new Set<string>();
@@ -157,10 +479,43 @@ export class ChapterTrainer {
 
   constructor(chapter: RepertoireChapter) {
     this.chapter = chapter;
+    this.chapterRevision = trainerChapterRevision(chapter);
     this.currentNodeId = chapter.rootNodeId;
     this.linesById = new Map(chapter.lines.map((line) => [line.id, line]));
     this.pendingInitial = new Set(chapter.lines.map((line) => line.id));
     this.assertChapterIntegrity();
+  }
+
+  /**
+   * Restores a checkpoint created by `exportSession`. The input may be the
+   * structured-clone object itself or its JSON string representation.
+   */
+  static restoreSession(
+    chapter: RepertoireChapter,
+    checkpoint: unknown,
+    now = Date.now(),
+  ): ChapterTrainer {
+    if (!Number.isFinite(now) || now < 0) {
+      restoreError("INVALID_SNAPSHOT", "Restore time must be non-negative.");
+    }
+
+    const parsed = parseSerializedSession(checkpoint);
+    if (parsed.chapterId !== chapter.id) {
+      restoreError(
+        "CHAPTER_MISMATCH",
+        "The saved session belongs to a different chapter.",
+      );
+    }
+    const trainer = new ChapterTrainer(chapter);
+    if (parsed.chapterRevision !== trainer.chapterRevision) {
+      restoreError(
+        "STALE_CHAPTER",
+        "The chapter moves changed after this session was saved.",
+      );
+    }
+
+    trainer.restoreParsedState(parsed, now);
+    return trainer;
   }
 
   start(now = Date.now()): TrainerTransition {
@@ -281,6 +636,43 @@ export class ChapterTrainer {
     return this.transition(events);
   }
 
+  /** Returns a deeply detached, JSON-safe checkpoint of this session. */
+  exportSession(now = Date.now()): SerializedTrainerSession {
+    if (!Number.isFinite(now) || now < 0) {
+      throw new RangeError("Checkpoint time must be a finite non-negative number.");
+    }
+
+    const promptElapsedMs =
+      this.status === "awaiting-user" || this.status === "showing-correction"
+        ? Math.max(0, now - this.promptStartedAt)
+        : 0;
+
+    return {
+      version: TRAINER_SESSION_VERSION,
+      savedAt: now,
+      chapterId: this.chapter.id,
+      chapterRevision: this.chapterRevision,
+      state: {
+        phase: this.phase,
+        status: this.status,
+        currentNodeId: this.currentNodeId,
+        scheduledLineId: this.scheduledLineId,
+        routeLineId: this.routeLineId,
+        actualMoveIds: [...this.actualMoveIds],
+        pendingInitialLineIds: [...this.pendingInitial],
+        dirtyLineOrder: [...this.dirtyLineOrder],
+        reviewQueue: [...this.reviewQueue],
+        trialHadError: this.trialHadError,
+        trialHadAlternative: this.trialHadAlternative,
+        promptHadError: this.promptHadError,
+        promptElapsedMs,
+        correctionPlayedUci: this.correction?.playedUci,
+        attempts: this.getAttempts(),
+        grades: this.getSessionCardGrades(),
+      },
+    };
+  }
+
   getSnapshot(): TrainerSnapshot {
     const node = this.currentNode();
     const snapshot: TrainerSnapshot = {
@@ -323,6 +715,300 @@ export class ChapterTrainer {
 
   getSessionCardGrades(): SessionCardGrade[] {
     return [...this.grades.values()].map((grade) => ({ ...grade }));
+  }
+
+  private restoreParsedState(
+    checkpoint: SerializedTrainerSessionV1,
+    now: number,
+  ): void {
+    const state = checkpoint.state;
+    this.phase = state.phase;
+    this.status = state.status;
+    this.currentNodeId = state.currentNodeId;
+    this.scheduledLineId = state.scheduledLineId;
+    this.routeLineId = state.routeLineId;
+    this.actualMoveIds = [...state.actualMoveIds];
+    this.trialHadError = state.trialHadError;
+    this.trialHadAlternative = state.trialHadAlternative;
+    this.promptHadError = state.promptHadError;
+    this.promptStartedAt = now - state.promptElapsedMs;
+    if (!Number.isFinite(this.promptStartedAt)) {
+      restoreError(
+        "INVALID_SNAPSHOT",
+        "The saved prompt duration is outside the supported range.",
+      );
+    }
+    this.correction = undefined;
+
+    this.pendingInitial.clear();
+    for (const lineId of state.pendingInitialLineIds) {
+      this.pendingInitial.add(lineId);
+    }
+
+    this.dirtyLineIds.clear();
+    this.dirtyLineOrder.splice(0);
+    for (const lineId of state.dirtyLineOrder) {
+      this.dirtyLineIds.add(lineId);
+      this.dirtyLineOrder.push(lineId);
+    }
+
+    this.reviewQueue.splice(0);
+    this.reviewQueue.push(...state.reviewQueue);
+    this.attempts.splice(0);
+    this.attempts.push(...state.attempts.map((attempt) => ({ ...attempt })));
+    this.grades.clear();
+    const restoredGradeIds = new Set<string>();
+    for (const grade of state.grades) {
+      if (restoredGradeIds.has(grade.cardId)) {
+        restoreError("INVALID_SNAPSHOT", "The saved card grades contain duplicates.");
+      }
+      restoredGradeIds.add(grade.cardId);
+      this.grades.set(grade.cardId, { ...grade });
+    }
+
+    this.assertRestoredState(state.correctionPlayedUci, state.promptElapsedMs);
+  }
+
+  private assertRestoredState(
+    correctionPlayedUci: string | undefined,
+    promptElapsedMs: number,
+  ): void {
+    const invalid = (message: string): never =>
+      restoreError("INVALID_SNAPSHOT", message);
+    const knownLineIds = new Set(this.chapter.lines.map((line) => line.id));
+    const knownCardIds = new Set(
+      Object.values(this.chapter.moves)
+        .map((move) => move.cardId)
+        .filter((cardId): cardId is string => Boolean(cardId)),
+    );
+
+    const assertUniqueKnownLines = (lineIds: string[], field: string): void => {
+      const seen = new Set<string>();
+      for (const lineId of lineIds) {
+        if (!knownLineIds.has(lineId)) {
+          invalid(`${field} contains an unknown line.`);
+        }
+        if (seen.has(lineId)) {
+          invalid(`${field} contains a duplicate line.`);
+        }
+        seen.add(lineId);
+      }
+    };
+
+    assertUniqueKnownLines([...this.pendingInitial], "pendingInitialLineIds");
+    assertUniqueKnownLines(this.dirtyLineOrder, "dirtyLineOrder");
+    assertUniqueKnownLines(this.reviewQueue, "reviewQueue");
+    for (const lineId of this.reviewQueue) {
+      if (!this.dirtyLineIds.has(lineId)) {
+        invalid("reviewQueue contains a line that was never marked for review.");
+      }
+    }
+
+    if (this.phase === "initial" && this.reviewQueue.length > 0) {
+      invalid("An initial-phase checkpoint cannot contain a review queue.");
+    }
+    if (this.phase !== "initial" && this.pendingInitial.size > 0) {
+      invalid("A review or completed session cannot have initial lines pending.");
+    }
+    if (this.phase === "complete") {
+      if (this.status !== "complete") {
+        invalid("A completed phase must have completed status.");
+      }
+      if (this.reviewQueue.length > 0) {
+        invalid("A completed session cannot have review lines pending.");
+      }
+      if (this.trialHadError || this.trialHadAlternative) {
+        invalid("A completed session cannot have unfinished trial results.");
+      }
+    } else if (this.status === "complete") {
+      invalid("Completed status requires the completed phase.");
+    }
+
+    const isActiveStatus =
+      this.status === "awaiting-user" ||
+      this.status === "showing-correction" ||
+      this.status === "line-complete";
+    if (isActiveStatus) {
+      if (!this.scheduledLineId || !knownLineIds.has(this.scheduledLineId)) {
+        invalid("The active scheduled line is missing or unknown.");
+      }
+      if (!this.routeLineId || !knownLineIds.has(this.routeLineId)) {
+        invalid("The active route line is missing or unknown.");
+      }
+    } else if (this.scheduledLineId || this.routeLineId) {
+      invalid("An idle or completed session cannot have an active line.");
+    }
+
+    if (this.status === "idle") {
+      if (
+        this.phase !== "initial" ||
+        this.currentNodeId !== this.chapter.rootNodeId ||
+        this.actualMoveIds.length > 0 ||
+        this.pendingInitial.size !== this.chapter.lines.length ||
+        this.dirtyLineOrder.length > 0 ||
+        this.attempts.length > 0 ||
+        this.grades.size > 0
+      ) {
+        invalid("The idle trainer state is inconsistent.");
+      }
+    }
+
+    let pathLine: TrainingLine | undefined;
+    if (this.routeLineId) {
+      pathLine = this.linesById.get(this.routeLineId);
+    } else if (this.status === "complete" && this.actualMoveIds.length > 0) {
+      pathLine = this.chapter.lines.find(
+        (line) =>
+          line.moveIds.length === this.actualMoveIds.length &&
+          isPrefix(this.actualMoveIds, line.moveIds),
+      );
+      if (!pathLine) {
+        invalid("The completed move path does not belong to the chapter.");
+      }
+    }
+
+    let expectedNodeId = this.chapter.rootNodeId;
+    if (pathLine) {
+      if (!isPrefix(this.actualMoveIds, pathLine.moveIds)) {
+        invalid("The saved moves are not a prefix of the active route.");
+      }
+      for (const moveId of this.actualMoveIds) {
+        const move = this.chapter.moves[moveId];
+        if (!move || move.fromNodeId !== expectedNodeId) {
+          invalid("The saved move path is not continuous.");
+        }
+        expectedNodeId = move.toNodeId;
+      }
+    } else if (this.actualMoveIds.length > 0) {
+      invalid("Moves were saved without a corresponding training route.");
+    }
+
+    if (
+      !this.chapter.positions[this.currentNodeId] ||
+      this.currentNodeId !== expectedNodeId
+    ) {
+      invalid("The saved board position does not match its move path.");
+    }
+
+    if (this.status === "line-complete") {
+      if (!pathLine || this.actualMoveIds.length !== pathLine.moveIds.length) {
+        invalid("A completed line must end at the end of its route.");
+      }
+    } else if (
+      (this.status === "awaiting-user" ||
+        this.status === "showing-correction") &&
+      (!pathLine || this.actualMoveIds.length >= pathLine.moveIds.length)
+    ) {
+      invalid("A prompt requires a remaining move on its route.");
+    }
+
+    const isPrompting =
+      this.status === "awaiting-user" || this.status === "showing-correction";
+    if (!isPrompting && promptElapsedMs !== 0) {
+      invalid("Only an active prompt may have elapsed response time.");
+    }
+    if (!isPrompting && this.promptHadError) {
+      invalid("Only an active prompt may be marked for retry.");
+    }
+    if (this.promptHadError && !this.trialHadError) {
+      invalid("A retry prompt must belong to an errored line attempt.");
+    }
+
+    if (
+      this.status === "idle" &&
+      (this.trialHadError || this.trialHadAlternative)
+    ) {
+      invalid("An idle trainer cannot have trial results.");
+    }
+
+    if (this.status !== "complete" && this.trialHadAlternative) {
+      if (!this.scheduledLineId || this.routeLineId === this.scheduledLineId) {
+        invalid("An alternative route must differ from the scheduled line.");
+      }
+    } else if (
+      this.scheduledLineId &&
+      this.routeLineId &&
+      this.routeLineId !== this.scheduledLineId
+    ) {
+      invalid("A changed route must be marked as an alternative.");
+    }
+
+    if (isPrompting) {
+      const route = pathLine!;
+      const target = this.chapter.moves[route.moveIds[this.actualMoveIds.length]];
+      const node = this.currentNode();
+      if (
+        !target ||
+        target.fromNodeId !== node.id ||
+        node.turn !== colorToTurn(this.chapter.repertoireColor)
+      ) {
+        invalid("The restored prompt is not on the repertoire side to move.");
+      }
+    }
+
+    if (this.status === "showing-correction") {
+      if (!this.promptHadError) {
+        invalid("A revealed correction must include its failed move.");
+      }
+      if (correctionPlayedUci === undefined) {
+        invalid("A revealed correction must include its failed move.");
+      }
+      const playedUci = correctionPlayedUci as string;
+      const legalUci = this.toLegalUci(playedUci, this.currentNode().fen);
+      if (legalUci !== playedUci) {
+        invalid("The saved correction move is not legal in its position.");
+      }
+      const route = pathLine!;
+      const target = this.chapter.moves[route.moveIds[this.actualMoveIds.length]];
+      const correctionIsAccepted = this.compatibleNextMoveIds().some(
+        (moveId) => this.chapter.moves[moveId].uci === playedUci,
+      );
+      if (correctionIsAccepted) {
+        invalid("A saved correction cannot be an accepted repertoire move.");
+      }
+      const knownAvoidMove = Object.values(this.chapter.moves).find(
+        (move) =>
+          move.fromNodeId === this.currentNodeId &&
+          move.trainingRole === "avoid" &&
+          move.uci === playedUci,
+      );
+      this.correction = {
+        playedUci,
+        correctMove: this.toPromptMove(target, true),
+        acceptedMoves: this.acceptedPromptMoves(target.id),
+        knownAvoidMove: knownAvoidMove
+          ? this.cloneMoveWithDedupedAnnotations(knownAvoidMove)
+          : undefined,
+      };
+    } else if (correctionPlayedUci !== undefined) {
+      invalid("A correction move was saved without a revealed correction.");
+    }
+
+    for (const attempt of this.attempts) {
+      const node = this.chapter.positions[attempt.nodeId];
+      if (
+        attempt.chapterId !== this.chapter.id ||
+        !knownLineIds.has(attempt.scheduledLineId) ||
+        !knownLineIds.has(attempt.routeLineId) ||
+        !node ||
+        node.positionKey !== attempt.positionKey ||
+        (attempt.targetCardId !== undefined &&
+          !knownCardIds.has(attempt.targetCardId)) ||
+        (attempt.playedCardId !== undefined &&
+          !knownCardIds.has(attempt.playedCardId))
+      ) {
+        invalid("The saved attempt history does not match this chapter.");
+      }
+    }
+
+    for (const grade of this.grades.values()) {
+      if (
+        !knownCardIds.has(grade.cardId) ||
+        grade.lastAttemptAt < grade.firstAttemptAt
+      ) {
+        invalid("The saved card grades are invalid for this chapter.");
+      }
+    }
   }
 
   private beginNextLine(events: TrainerEvent[], now: number): void {

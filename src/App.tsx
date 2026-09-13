@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Chess, type Color } from 'chess.js';
 import { Chessboard, type Arrow } from 'react-chessboard';
+import type { GameReviewDrillResult, GameReviewTrainingAggregate } from '../shared/game-review.js';
 import type { RepertoireChapter, RepertoireMove } from '../shared/repertoire.js';
-import { ChapterTrainer, type PromptMove, type TrainerSnapshot, type TrainerTransition } from '../shared/trainer.js';
+import { applySessionCardGrades, listChapterSrsCards, type SrsProgress } from '../shared/srs.js';
+import { ChapterTrainer, type PromptMove, type SessionCardGrade, type TrainerSnapshot, type TrainerTransition } from '../shared/trainer.js';
 import { beginLogin, getAuthStatus, getChapter, getLibrary, logout, syncStudies } from './api';
 import ChessComReview from './ChessComReview';
 import OpeningPractice from './OpeningPractice';
@@ -11,9 +13,94 @@ import {
   extractStudyAnnotationMoments,
   type StudyAnnotationMoment,
 } from './study-annotations.js';
+import { chapterForCardReview, chapterForLineIds } from './training-chapter.js';
+import {
+  createTrainingState,
+  loadTrainingState,
+  mergeReviewPosition,
+  pruneStaleSrsCards,
+  saveTrainingCheckpointJournal,
+  saveTrainingState,
+  type SavedTrainingMode,
+  type SavedTrainingSession,
+  type TrainingState,
+} from './training-storage.js';
 import type { AuthStatus, ChapterDetail, ChapterSummary, LibraryPayload, StudySummary, SyncResult } from './types';
 
 type Toast = { message: string; tone: 'success' | 'error' } | null;
+
+interface ActiveTraining {
+  chapter: ChapterDetail;
+  mode: SavedTrainingMode;
+  sample: boolean;
+  resume?: SavedTrainingSession;
+  remainingTodayReviews?: ChapterDetail[];
+}
+
+interface ChapterProgress {
+  reviewedCards: number;
+  dueCards: number;
+  masteryPercent: number;
+  lapseCount: number;
+}
+
+function chapterProgress(summary: ChapterSummary, srs: SrsProgress, now = Date.now()): ChapterProgress {
+  const records = Object.values(srs.cards).filter(
+    (record) => record.studyId === summary.studyId && record.chapterId === summary.id,
+  );
+  return {
+    reviewedCards: records.length,
+    dueCards: records.filter((record) => record.dueAt <= now).length,
+    masteryPercent: summary.cardCount > 0
+      ? Math.round(records.reduce((total, record) => total + record.mastery, 0) / summary.cardCount)
+      : 0,
+    lapseCount: records.reduce((total, record) => total + record.lapseCount, 0),
+  };
+}
+
+function summarizeProgress(library: LibraryPayload, srs: SrsProgress, now = Date.now()) {
+  const knownChapters = new Set(
+    library.studies.flatMap((study) => study.chapters.map((chapter) => `${chapter.studyId || study.id}\u0000${chapter.id}`)),
+  );
+  const records = Object.values(srs.cards).filter((record) => knownChapters.has(`${record.studyId}\u0000${record.chapterId}`));
+  const totalCards = library.studies.reduce(
+    (total, study) => total + study.chapters.reduce((sum, chapter) => sum + chapter.cardCount, 0),
+    0,
+  );
+  return {
+    dueCards: records.filter((record) => record.dueAt <= now).length,
+    reviewedCards: records.length,
+    masteryPercent: totalCards > 0
+      ? Math.round(records.reduce((total, record) => total + record.mastery, 0) / totalCards)
+      : 0,
+  };
+}
+
+function findChapterSummary(library: LibraryPayload, studyId: string, chapterId: string): ChapterSummary | undefined {
+  return library.studies
+    .flatMap((study) => study.chapters)
+    .find((chapter) => chapter.studyId === studyId && chapter.id === chapterId);
+}
+
+function settleActiveSession(state: TrainingState): TrainingState {
+  const session = state.activeSession;
+  if (!session) return state;
+  try {
+    return {
+      ...state,
+      srs: applySessionCardGrades(
+        state.srs,
+        { studyId: session.studyId, chapterId: session.chapterId },
+        session.checkpoint.state.grades,
+      ),
+      activeSession: undefined,
+    };
+  } catch {
+    // A storage document may survive an interrupted/older app write. Never let
+    // a malformed optional checkpoint trap the user on the resume screen.
+    return { ...state, activeSession: undefined };
+  }
+}
 
 const Icon = ({ name, size = 20 }: { name: 'book' | 'sync' | 'lock' | 'arrow' | 'check' | 'spark' | 'target' | 'logout' | 'back' | 'external' | 'clock'; size?: number }) => {
   const paths: Record<typeof name, React.ReactNode> = {
@@ -65,7 +152,7 @@ function EmptyLibrary({ onSync }: { onSync: () => void }) {
   return <div className="empty-state"><span className="empty-icon"><Icon name="book" size={28} /></span><h3>가져온 연구가 없습니다</h3><p>리체스에서 직접 만든 연구를 동기화하면 이곳에 챕터별로 정리됩니다.</p><button className="button button-primary" onClick={onSync}><Icon name="sync" /> 지금 동기화</button></div>;
 }
 
-function StudyCard({ study, onTrain }: { study: StudySummary; onTrain: (chapter: ChapterSummary) => void }) {
+function StudyCard({ study, srs, onTrain }: { study: StudySummary; srs: SrsProgress; onTrain: (chapter: ChapterSummary) => void }) {
   const [open, setOpen] = useState(true);
   const color = study.orientation ?? study.chapters[0]?.orientation ?? 'white';
   const totalCards = study.chapters.reduce((sum, chapter) => sum + chapter.cardCount, 0);
@@ -79,25 +166,33 @@ function StudyCard({ study, onTrain }: { study: StudySummary; onTrain: (chapter:
       </button>
       {open && (
         <div className="chapter-list">
-          {study.chapters.map((chapter, index) => (
-            <div className="chapter-row" key={chapter.id}>
-              <span className="chapter-number">{String(index + 1).padStart(2, '0')}</span>
-              <span className="chapter-copy"><strong>{chapter.name}</strong><small>{chapter.lineCount || '—'} 라인 · {chapter.cardCount || '—'} 포지션</small></span>
-              <span className="mastery" aria-label="새 챕터"><i style={{ width: '0%' }} /><small>새 챕터</small></span>
-              {chapter.sourceUrl && <a className="source-link" href={chapter.sourceUrl} target="_blank" rel="noreferrer" aria-label="리체스에서 보기" onClick={(event) => event.stopPropagation()}><Icon name="external" size={17} /></a>}
-              <button className="button chapter-button" type="button" onClick={() => onTrain(chapter)}>훈련 <Icon name="arrow" size={17} /></button>
-            </div>
-          ))}
+          {study.chapters.map((chapter, index) => {
+            const learned = chapterProgress(chapter, srs);
+            const progressLabel = learned.reviewedCards
+              ? `${learned.masteryPercent}%${learned.dueCards ? ` · 복습 ${learned.dueCards}` : ''}`
+              : '새 챕터';
+            return (
+              <div className="chapter-row" key={chapter.id}>
+                <span className="chapter-number">{String(index + 1).padStart(2, '0')}</span>
+                <span className="chapter-copy"><strong>{chapter.name}</strong><small>{chapter.lineCount || '—'} 라인 · {chapter.cardCount || '—'} 포지션</small></span>
+                <span className="mastery" aria-label={`숙련도 ${learned.masteryPercent}%`}><i style={{ width: `${learned.masteryPercent}%` }} /><small>{progressLabel}</small></span>
+                {chapter.sourceUrl && <a className="source-link" href={chapter.sourceUrl} target="_blank" rel="noreferrer" aria-label="리체스에서 보기" onClick={(event) => event.stopPropagation()}><Icon name="external" size={17} /></a>}
+                <button className="button chapter-button" type="button" onClick={() => onTrain(chapter)}>훈련 <Icon name="arrow" size={17} /></button>
+              </div>
+            );
+          })}
         </div>
       )}
     </article>
   );
 }
 
-function LibraryScreen({ library, auth, syncing, lastSync, libraryError, syncReport, onSync, onTrain, onPractice, onReview }: { library: LibraryPayload; auth: AuthStatus; syncing: boolean; lastSync: string | null; libraryError: string | null; syncReport: SyncResult | null; onSync: () => void; onTrain: (chapter: ChapterSummary) => void; onPractice: () => void; onReview: () => void }) {
+function LibraryScreen({ library, auth, trainingState, syncing, lastSync, libraryError, syncReport, onSync, onTrain, onResume, onTodayReview, onPractice, onReview }: { library: LibraryPayload; auth: AuthStatus; trainingState: TrainingState; syncing: boolean; lastSync: string | null; libraryError: string | null; syncReport: SyncResult | null; onSync: () => void; onTrain: (chapter: ChapterSummary) => void; onResume: () => void; onTodayReview: () => void; onPractice: () => void; onReview: () => void }) {
   const chapterCount = library.studies.reduce((sum, study) => sum + study.chapters.length, 0);
   const positionCount = library.studies.reduce((total, study) => total + study.chapters.reduce((sum, chapter) => sum + chapter.cardCount, 0), 0);
   const syncErrors = Array.isArray(syncReport?.errors) ? syncReport.errors : [];
+  const learning = summarizeProgress(library, trainingState.srs);
+  const queuedReviews = Object.keys(trainingState.reviewQueue).length;
   return (
     <main className="library page-shell">
       <section className="hero">
@@ -112,6 +207,27 @@ function LibraryScreen({ library, auth, syncing, lastSync, libraryError, syncRep
           <div><span className="stat-icon gold"><Icon name="clock" /></span><strong>{positionCount || '—'}</strong><small>훈련 포지션</small></div>
         </div>
       </section>
+
+      {(trainingState.activeSession || learning.reviewedCards > 0) && (
+        <section className="learning-dashboard" aria-label="학습 현황">
+          {trainingState.activeSession && (
+            <div className="resume-card">
+              <span className="resume-card-icon"><Icon name="arrow" /></span>
+              <div>
+                <span className="eyebrow">CONTINUE TRAINING</span>
+                <strong>{trainingState.activeSession.chapterName}</strong>
+                <small>{new Date(trainingState.activeSession.savedAt).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} 자동 저장</small>
+              </div>
+              <button className="button button-primary" type="button" onClick={onResume}>이어서 훈련 <Icon name="arrow" size={17} /></button>
+            </div>
+          )}
+          <div className="srs-card">
+            <div><span className="eyebrow">TODAY'S REVIEW</span><strong>{learning.dueCards}</strong><small>오늘 복습할 포지션</small></div>
+            <div><span>전체 숙련도</span><strong>{learning.masteryPercent}%</strong><i><b style={{ width: `${learning.masteryPercent}%` }} /></i></div>
+            <button className="button button-secondary" type="button" onClick={onTodayReview} disabled={learning.dueCards === 0}>{learning.dueCards ? '오늘의 복습 시작' : '예정된 복습 없음'}</button>
+          </div>
+        </section>
+      )}
 
       {library.sample && !auth.connected && (
         <section className="sample-banner">
@@ -168,8 +284,8 @@ function LibraryScreen({ library, auth, syncing, lastSync, libraryError, syncRep
           <p>최근 공개 대국을 불러와 리체스 연구와 비교하고, 처음 달라진 포지션부터 다시 확인합니다.</p>
         </div>
         <div className="review-launch-action">
-          <small>기본 계정 <strong>Yshaarrj</strong></small>
-          <button className="button button-secondary" type="button" onClick={onReview}>최근 대국 복기 <Icon name="arrow" size={17} /></button>
+          <small>{queuedReviews ? <>저장된 복습 <strong>{queuedReviews}개</strong></> : <>기본 계정 <strong>Yshaarrj</strong></>}</small>
+          <button className="button button-secondary" type="button" onClick={onReview}>{queuedReviews ? '저장한 복습 열기' : '최근 대국 복기'} <Icon name="arrow" size={17} /></button>
         </div>
       </section>
 
@@ -181,7 +297,7 @@ function LibraryScreen({ library, auth, syncing, lastSync, libraryError, syncRep
         </div>
       </section>
 
-      {library.studies.length ? <div className="study-grid">{library.studies.map((study) => <StudyCard study={study} onTrain={onTrain} key={study.id} />)}</div> : <EmptyLibrary onSync={onSync} />}
+      {library.studies.length ? <div className="study-grid">{library.studies.map((study) => <StudyCard study={study} srs={trainingState.srs} onTrain={onTrain} key={study.id} />)}</div> : <EmptyLibrary onSync={onSync} />}
     </main>
   );
 }
@@ -205,22 +321,42 @@ function studyAnnotationMomentsForTransition(
   return rootMoment ? [rootMoment, ...moveMoments] : moveMoments;
 }
 
-function TrainerScreen({ chapter, onBack }: { chapter: ChapterDetail; onBack: () => void }) {
-  const [{ trainer, initialTransition }] = useState(() => {
+function TrainerScreen({ training, onBack, onCheckpoint, onComplete }: {
+  training: ActiveTraining;
+  onBack: (session?: SavedTrainingSession) => void;
+  onCheckpoint: (session: SavedTrainingSession) => void;
+  onComplete: (grades: readonly SessionCardGrade[]) => void;
+}) {
+  const { chapter, resume } = training;
+  const [{ trainer, initialSnapshot, initialAnnotations }] = useState(() => {
+    if (resume) {
+      const restored = ChapterTrainer.restoreSession(chapter.repertoire, resume.checkpoint);
+      return {
+        trainer: restored,
+        initialSnapshot: restored.getSnapshot(),
+        initialAnnotations: resume.ui.annotationMoments,
+      };
+    }
     const nextTrainer = new ChapterTrainer(chapter.repertoire);
-    return { trainer: nextTrainer, initialTransition: nextTrainer.start() };
+    const initialTransition = nextTrainer.start();
+    return {
+      trainer: nextTrainer,
+      initialSnapshot: initialTransition.snapshot,
+      initialAnnotations: studyAnnotationMomentsForTransition(initialTransition, chapter.repertoire),
+    };
   });
-  const [snapshot, setSnapshot] = useState<TrainerSnapshot>(initialTransition.snapshot);
+  const [snapshot, setSnapshot] = useState<TrainerSnapshot>(initialSnapshot);
   const [annotationMoments, setAnnotationMoments] = useState<StudyAnnotationMoment[]>(
-    () => studyAnnotationMomentsForTransition(initialTransition, chapter.repertoire),
+    initialAnnotations,
   );
   const [selected, setSelected] = useState<string | null>(null);
-  const [revealed, setRevealed] = useState<PromptMove | null>(null);
-  const [knownAvoidMove, setKnownAvoidMove] = useState<RepertoireMove | null>(null);
+  const [revealed, setRevealed] = useState<PromptMove | null>(() => resume?.ui.revealed ?? initialSnapshot.correction?.correctMove ?? null);
+  const [knownAvoidMove, setKnownAvoidMove] = useState<RepertoireMove | null>(() => resume?.ui.knownAvoidMove ?? initialSnapshot.correction?.knownAvoidMove ?? null);
   const [correctFeedback, setCorrectFeedback] = useState<CorrectFeedback>(null);
-  const [lastMoveUci, setLastMoveUci] = useState<string | null>(null);
-  const [wrongCount, setWrongCount] = useState(0);
-  const [correctCount, setCorrectCount] = useState(0);
+  const [lastMoveUci, setLastMoveUci] = useState<string | null>(resume?.ui.lastMoveUci ?? null);
+  const [wrongCount, setWrongCount] = useState(resume?.ui.wrongCount ?? 0);
+  const [correctCount, setCorrectCount] = useState(resume?.ui.correctCount ?? 0);
+  const completionReported = useRef(false);
   const repertoire = chapter.repertoire;
   const activeAnnotation = annotationMoments[0] ?? null;
   const userColor: Color = chapter.orientation === 'white' ? 'w' : 'b';
@@ -251,6 +387,47 @@ function TrainerScreen({ chapter, onBack }: { chapter: ChapterDetail; onBack: ()
           : snapshot.status === 'awaiting-user'
             ? 'awaiting'
             : 'moving';
+
+  const buildSavedSession = useCallback((): SavedTrainingSession => {
+    const savedAt = Date.now();
+    return {
+      studyId: chapter.studyId,
+      chapterId: chapter.id,
+      chapterName: chapter.name,
+      orientation: chapter.orientation,
+      sample: training.sample,
+      mode: training.mode,
+      selectedLineIds: chapter.repertoire.lines.map((item) => item.id),
+      ...(training.mode === 'today-review' ? {
+        selectedCardIds: [...new Set(chapter.repertoire.lines.flatMap((item) => item.userCardIds))],
+      } : {}),
+      savedAt,
+      checkpoint: trainer.exportSession(savedAt),
+      ui: {
+        annotationMoments,
+        revealed: revealed ?? undefined,
+        knownAvoidMove: knownAvoidMove ?? undefined,
+        lastMoveUci: lastMoveUci ?? undefined,
+        wrongCount,
+        correctCount,
+      },
+    };
+  }, [annotationMoments, chapter, correctCount, knownAvoidMove, lastMoveUci, revealed, trainer, training.mode, training.sample, wrongCount]);
+
+  useEffect(() => {
+    if (snapshot.status === 'complete') return;
+    onCheckpoint(buildSavedSession());
+  }, [buildSavedSession, onCheckpoint, snapshot]);
+
+  useEffect(() => {
+    if (snapshot.status !== 'complete' || completionReported.current) return;
+    completionReported.current = true;
+    onComplete(trainer.getSessionCardGrades());
+  }, [onComplete, snapshot.status, trainer]);
+
+  const handleBack = useCallback(() => {
+    onBack(snapshot.status === 'complete' ? undefined : buildSavedSession());
+  }, [buildSavedSession, onBack, snapshot.status]);
 
   useEffect(() => {
     if (snapshot.status !== 'line-complete' || activeAnnotation) return;
@@ -310,10 +487,13 @@ function TrainerScreen({ chapter, onBack }: { chapter: ChapterDetail; onBack: ()
     }
     if (transition.events.some((event) => event.type === 'illegal-move')) {
       setSelected(null);
+      // Illegal attempts change the trainer checkpoint even though the board
+      // and prompt stay put, so persist them without relying on a React render.
+      onCheckpoint(buildSavedSession());
       return false;
     }
     return applyAcceptedTransition(transition);
-  }, [activeAnnotation, applyAcceptedTransition, snapshot.prompt, snapshot.status, trainer]);
+  }, [activeAnnotation, applyAcceptedTransition, buildSavedSession, onCheckpoint, snapshot.prompt, snapshot.status, trainer]);
 
   const handleSquareClick = useCallback(({ square }: { square: string }) => {
     if (activeAnnotation || snapshot.status !== 'awaiting-user' || correctFeedback) return;
@@ -371,18 +551,18 @@ function TrainerScreen({ chapter, onBack }: { chapter: ChapterDetail; onBack: ()
           ? '틀렸던 수를 다시 찾아보세요'
           : `${chapter.orientation === 'white' ? '백' : '흑'}의 수를 두세요`;
 
-  if (!line && phase !== 'complete') return <div className="trainer-error"><p>훈련할 라인이 없습니다.</p><button className="button" onClick={onBack}>돌아가기</button></div>;
+  if (!line && phase !== 'complete') return <div className="trainer-error"><p>훈련할 라인이 없습니다.</p><button className="button" onClick={handleBack}>돌아가기</button></div>;
 
   if (phase === 'complete') {
     return (
       <main className="completion page-shell">
         <div className="completion-card">
           <span className="completion-mark"><Icon name="check" size={42} /></span>
-          <span className="eyebrow">CHAPTER COMPLETE</span>
+          <span className="eyebrow">{training.mode === 'today-review' ? 'TODAY REVIEW COMPLETE' : 'CHAPTER COMPLETE'}</span>
           <h1>{hadReview ? '오답까지 깨끗하게 끝냈어요.' : '챕터 훈련을 마쳤어요.'}</h1>
           <p>{chapter.name}</p>
           <div className="result-grid"><div><strong>{repertoire.lines.length}</strong><small>학습 라인</small></div><div><strong>{wrongCount}</strong><small>틀린 횟수</small></div><div><strong>{snapshot.mistakeLineIds.length}</strong><small>오답 복습 라인</small></div></div>
-          <button className="button button-primary" onClick={onBack}>라이브러리로 돌아가기 <Icon name="arrow" /></button>
+          <button className="button button-primary" onClick={handleBack}>라이브러리로 돌아가기 <Icon name="arrow" /></button>
         </div>
       </main>
     );
@@ -413,8 +593,8 @@ function TrainerScreen({ chapter, onBack }: { chapter: ChapterDetail; onBack: ()
   return (
     <main className="trainer-shell">
       <div className="trainer-topline">
-        <button className="back-button" onClick={onBack}><Icon name="back" size={18} /> 라이브러리</button>
-        <div className="trainer-title"><small>{isReview ? `오답 복습 · ${snapshot.reviewRemaining}라인 남음` : chapter.orientation === 'white' ? '백 레퍼토리' : '흑 레퍼토리'}</small><strong>{chapter.name}</strong></div>
+        <button className="back-button" onClick={handleBack}><Icon name="back" size={18} /> 라이브러리</button>
+        <div className="trainer-title"><small>{isReview ? `오답 복습 · ${snapshot.reviewRemaining}라인 남음` : training.mode === 'today-review' ? '오늘의 복습' : chapter.orientation === 'white' ? '백 레퍼토리' : '흑 레퍼토리'}</small><strong>{chapter.name}</strong></div>
         <div className="trainer-counter">{isReview ? <><span>{snapshot.reviewRemaining}</span> 남음</> : <><span>{scheduledIndex + 1}</span> / {repertoire.lines.length}</>}</div>
       </div>
       <div className="session-progress"><i style={{ width: `${progress}%` }} /></div>
@@ -466,7 +646,8 @@ function TrainerScreen({ chapter, onBack }: { chapter: ChapterDetail; onBack: ()
 export default function App() {
   const [auth, setAuth] = useState<AuthStatus>({ connected: false });
   const [library, setLibrary] = useState<LibraryPayload | null>(null);
-  const [activeChapter, setActiveChapter] = useState<ChapterDetail | null>(null);
+  const [trainingState, setTrainingState] = useState<TrainingState | null>(null);
+  const [activeTraining, setActiveTraining] = useState<ActiveTraining | null>(null);
   const [practiceOpen, setPracticeOpen] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -475,6 +656,27 @@ export default function App() {
   const [libraryError, setLibraryError] = useState<string | null>(null);
   const [syncReport, setSyncReport] = useState<SyncResult | null>(null);
   const [toast, setToast] = useState<Toast>(null);
+  const trainingStateRef = useRef<TrainingState | null>(null);
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
+  const storageWarningShown = useRef(false);
+  const trainingStateLoaded = trainingState !== null;
+
+  const commitTrainingState = useCallback((update: (current: TrainingState) => TrainingState) => {
+    const current = trainingStateRef.current ?? createTrainingState();
+    const next = { ...update(current), updatedAt: Math.max(Date.now(), current.updatedAt + 1) };
+    trainingStateRef.current = next;
+    setTrainingState(next);
+    saveTrainingCheckpointJournal(next);
+    saveChainRef.current = saveChainRef.current
+      .catch(() => undefined)
+      .then(() => saveTrainingState(next))
+      .catch(() => {
+        if (storageWarningShown.current) return;
+        storageWarningShown.current = true;
+        setToast({ message: '훈련 기록을 기기에 저장하지 못했습니다. 브라우저 저장 공간을 확인해 주세요.', tone: 'error' });
+      });
+    return next;
+  }, []);
 
   const loadLibrary = useCallback(async (status: AuthStatus) => {
     try {
@@ -490,6 +692,24 @@ export default function App() {
       setToast({ message: `연구 목록을 불러오지 못했습니다: ${message}`, tone: 'error' });
       return false;
     }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void loadTrainingState()
+      .then((state) => {
+        if (!active) return;
+        trainingStateRef.current = state;
+        setTrainingState(state);
+      })
+      .catch(() => {
+        if (!active) return;
+        const state = createTrainingState();
+        trainingStateRef.current = state;
+        setTrainingState(state);
+        setToast({ message: '저장된 훈련 기록을 읽지 못해 새 기록으로 시작합니다.', tone: 'error' });
+      });
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
@@ -522,6 +742,41 @@ export default function App() {
       }
     })();
   }, [loadLibrary]);
+
+  useEffect(() => {
+    if (!library || !trainingStateLoaded || libraryError) return;
+    const current = trainingStateRef.current;
+    if (!current) return;
+    const summaries = new Map<string, ChapterSummary>();
+    for (const study of library.studies) {
+      for (const chapter of study.chapters) {
+        summaries.set(`${chapter.studyId || study.id}\u0000${chapter.id}`, chapter);
+      }
+    }
+    const chaptersToValidate = new Map<string, ChapterSummary>();
+    for (const record of Object.values(current.srs.cards)) {
+      const key = `${record.studyId}\u0000${record.chapterId}`;
+      const summary = summaries.get(key);
+      if (summary) chaptersToValidate.set(key, summary);
+    }
+    if (chaptersToValidate.size === 0) return;
+
+    let active = true;
+    void Promise.allSettled(
+      [...chaptersToValidate.values()].map((summary) => getChapter(summary, Boolean(library.sample))),
+    ).then((results) => {
+      if (!active) return;
+      const chapters = results.flatMap((result) => result.status === 'fulfilled' ? [result.value.repertoire] : []);
+      if (chapters.length === 0) return;
+      const latest = trainingStateRef.current;
+      if (!latest || pruneStaleSrsCards(latest.srs, chapters) === latest.srs) return;
+      commitTrainingState((state) => {
+        const srs = pruneStaleSrsCards(state.srs, chapters);
+        return srs === state.srs ? state : { ...state, srs };
+      });
+    });
+    return () => { active = false; };
+  }, [commitTrainingState, library, libraryError, trainingStateLoaded]);
 
   useEffect(() => {
     if (!toast) return;
@@ -568,10 +823,196 @@ export default function App() {
 
   const handleTrain = async (summary: ChapterSummary) => {
     setBusy(true);
-    try { setActiveChapter(await getChapter(summary, Boolean(library?.sample))); }
+    try {
+      const chapter = await getChapter(summary, Boolean(library?.sample));
+      commitTrainingState(settleActiveSession);
+      setPracticeOpen(false);
+      setReviewOpen(false);
+      setActiveTraining({ chapter, mode: 'chapter', sample: Boolean(library?.sample) });
+    }
     catch (error) { setToast({ message: error instanceof Error ? error.message : '챕터를 열지 못했습니다.', tone: 'error' }); }
     finally { setBusy(false); }
   };
+
+  const handleResume = useCallback(async () => {
+    const saved = trainingStateRef.current?.activeSession;
+    if (!saved || !library) return;
+    const summary = findChapterSummary(library, saved.studyId, saved.chapterId);
+    if (!summary) {
+      commitTrainingState(settleActiveSession);
+      setToast({ message: '저장한 챕터가 현재 연구에 없어 진행 기록만 보관하고 이어하기를 종료했습니다.', tone: 'error' });
+      return;
+    }
+    setBusy(true);
+    try {
+      const source = await getChapter(summary, saved.sample);
+      const reviewSource = saved.mode === 'today-review' && saved.selectedCardIds?.length
+        ? chapterForCardReview(source, saved.selectedCardIds)
+        : source;
+      const chapter = reviewSource ? chapterForLineIds(reviewSource, saved.selectedLineIds) : undefined;
+      if (!chapter) throw new Error('연구 수순이 바뀌어 저장한 훈련을 그대로 이어갈 수 없습니다.');
+      ChapterTrainer.restoreSession(chapter.repertoire, saved.checkpoint);
+      setActiveTraining({ chapter, mode: saved.mode, sample: saved.sample, resume: saved });
+    } catch (error) {
+      commitTrainingState(settleActiveSession);
+      setToast({ message: error instanceof Error ? error.message : '저장한 훈련을 복원하지 못했습니다.', tone: 'error' });
+    } finally {
+      setBusy(false);
+    }
+  }, [commitTrainingState, library]);
+
+  const handleTodayReview = useCallback(async () => {
+    const current = trainingStateRef.current;
+    if (!current || !library) return;
+    const now = Date.now();
+    const due = Object.values(current.srs.cards)
+      .filter((record) => record.dueAt <= now)
+      .map((record) => ({ record, summary: findChapterSummary(library, record.studyId, record.chapterId) }))
+      .filter((item): item is { record: (typeof current.srs.cards)[string]; summary: ChapterSummary } => Boolean(item.summary))
+      .sort((left, right) => left.record.dueAt - right.record.dueAt);
+    if (due.length === 0) {
+      setToast({ message: '지금 복습할 포지션이 없습니다.', tone: 'success' });
+      return;
+    }
+    setBusy(true);
+    try {
+      const groups = new Map<string, typeof due>();
+      for (const item of due) {
+        const key = `${item.record.studyId}\u0000${item.record.chapterId}`;
+        const group = groups.get(key) ?? [];
+        group.push(item);
+        groups.set(key, group);
+      }
+
+      let removedCards = 0;
+      const loadedChapters: RepertoireChapter[] = [];
+      const reviewChapters: ChapterDetail[] = [];
+      for (const group of groups.values()) {
+        const source = await getChapter(group[0].summary, Boolean(library.sample));
+        loadedChapters.push(source.repertoire);
+        const availableCardIds = new Set(listChapterSrsCards(source.repertoire).map((card) => card.cardId));
+        const staleCardIds = group
+          .map((item) => item.record.cardId)
+          .filter((cardId) => !availableCardIds.has(cardId));
+        removedCards += staleCardIds.length;
+
+        const cardIds = group
+          .map((item) => item.record.cardId)
+          .filter((cardId) => availableCardIds.has(cardId));
+        if (cardIds.length === 0) continue;
+
+        const chapter = chapterForCardReview(source, cardIds);
+        if (!chapter) throw new Error('예정된 복습 포지션의 수순을 구성하지 못했습니다. 연구를 다시 동기화해 주세요.');
+        reviewChapters.push(chapter);
+      }
+
+      commitTrainingState((state) => {
+        const srs = pruneStaleSrsCards(state.srs, loadedChapters);
+        return settleActiveSession(srs === state.srs ? state : { ...state, srs });
+      });
+      const [chapter, ...remainingTodayReviews] = reviewChapters;
+      if (chapter) {
+        setPracticeOpen(false);
+        setReviewOpen(false);
+        setActiveTraining({
+          chapter,
+          mode: 'today-review',
+          sample: Boolean(library.sample),
+          remainingTodayReviews,
+        });
+        return;
+      }
+
+      setToast({
+        message: removedCards > 0
+          ? `연구에서 삭제된 복습 ${removedCards}개를 정리했습니다. 지금 복습할 포지션은 없습니다.`
+          : '지금 복습할 포지션이 없습니다.',
+        tone: 'success',
+      });
+    } catch (error) {
+      setToast({ message: error instanceof Error ? error.message : '오늘의 복습을 열지 못했습니다.', tone: 'error' });
+    } finally {
+      setBusy(false);
+    }
+  }, [commitTrainingState, library]);
+
+  const handleTrainerCheckpoint = useCallback((session: SavedTrainingSession) => {
+    commitTrainingState((current) => ({ ...current, activeSession: session }));
+  }, [commitTrainingState]);
+
+  const handleTrainerComplete = useCallback((grades: readonly SessionCardGrade[]) => {
+    if (!activeTraining) return;
+    commitTrainingState((current) => ({
+      ...current,
+      srs: applySessionCardGrades(
+        current.srs,
+        { studyId: activeTraining.chapter.studyId, chapterId: activeTraining.chapter.id },
+        grades,
+      ),
+      activeSession: undefined,
+    }));
+    const [chapter, ...remainingTodayReviews] = activeTraining.remainingTodayReviews ?? [];
+    if (chapter) {
+      setActiveTraining({
+        chapter,
+        mode: 'today-review',
+        sample: activeTraining.sample,
+        remainingTodayReviews,
+      });
+    }
+  }, [activeTraining, commitTrainingState]);
+
+  const handleTrainerBack = useCallback((session?: SavedTrainingSession) => {
+    commitTrainingState((current) => ({ ...current, activeSession: session }));
+    setActiveTraining(null);
+  }, [commitTrainingState]);
+
+  const handleAddToReview = useCallback((position: GameReviewTrainingAggregate) => {
+    commitTrainingState((current) => ({
+      ...current,
+      reviewQueue: {
+        ...current.reviewQueue,
+        [position.positionKey]: mergeReviewPosition(current.reviewQueue[position.positionKey], position),
+      },
+    }));
+    setToast({ message: '이 포지션을 복습 목록에 저장했습니다.', tone: 'success' });
+  }, [commitTrainingState]);
+
+  const handleRemoveFromReview = useCallback((positionKey: string) => {
+    commitTrainingState((current) => {
+      if (!current.reviewQueue[positionKey]) return current;
+      const reviewQueue = { ...current.reviewQueue };
+      delete reviewQueue[positionKey];
+      return { ...current, reviewQueue };
+    });
+  }, [commitTrainingState]);
+
+  const handleReviewDrillComplete = useCallback((result: GameReviewDrillResult) => {
+    const completedAtValue = Date.parse(result.completedAt);
+    const completedAt = Number.isFinite(completedAtValue) ? completedAtValue : Date.now();
+    const candidate = result.trainingPosition.correctMoves.find((move) => move.uci === result.correctMove.uci);
+    const chapter = candidate?.chapters[0] ?? result.trainingPosition.matchingChapters[0];
+    commitTrainingState((current) => {
+      let srs = current.srs;
+      if (result.correctMove.cardId && chapter) {
+        srs = applySessionCardGrades(srs, chapter, [{
+          cardId: result.correctMove.cardId,
+          grade: result.firstTryCorrect ? 'good' : 'again',
+          firstAttemptAt: completedAt,
+          lastAttemptAt: completedAt,
+          totalResponseMs: 0,
+        }], completedAt);
+      }
+      if (!current.reviewQueue[result.positionKey]) return { ...current, srs };
+      const reviewQueue = { ...current.reviewQueue };
+      delete reviewQueue[result.positionKey];
+      return { ...current, srs, reviewQueue };
+    });
+    setToast({
+      message: result.firstTryCorrect ? '첫 시도 정답 · 다음 복습 일정을 저장했습니다.' : '다시 풀기를 완료했습니다 · 10분 뒤 한 번 더 복습합니다.',
+      tone: 'success',
+    });
+  }, [commitTrainingState]);
 
   const handlePractice = () => {
     setPracticeOpen(true);
@@ -581,19 +1022,28 @@ export default function App() {
     setReviewOpen(true);
   };
 
-  if (!library) return <div className="app-loading"><Mark /><span>훈련실을 준비하고 있어요</span></div>;
+  const queuedReviewPositions = useMemo(
+    () => Object.values(trainingState?.reviewQueue ?? {}).sort((left, right) => right.occurrenceCount - left.occurrenceCount),
+    [trainingState],
+  );
+  const queuedPositionKeys = useMemo(
+    () => new Set(queuedReviewPositions.map((position) => position.positionKey)),
+    [queuedReviewPositions],
+  );
+
+  if (!library || !trainingState) return <div className="app-loading"><Mark /><span>훈련실을 준비하고 있어요</span></div>;
 
   return (
     <div className="app">
-      {!activeChapter && !practiceOpen && !reviewOpen && <Header auth={auth} onLogin={handleLogin} onLogout={handleLogout} busy={busy} />}
-      {activeChapter
-        ? <TrainerScreen chapter={activeChapter} onBack={() => setActiveChapter(null)} />
+      {!activeTraining && !practiceOpen && !reviewOpen && <Header auth={auth} onLogin={handleLogin} onLogout={handleLogout} busy={busy} />}
+      {activeTraining
+        ? <TrainerScreen key={`${activeTraining.mode}:${activeTraining.chapter.studyId}:${activeTraining.chapter.id}`} training={activeTraining} onBack={handleTrainerBack} onCheckpoint={handleTrainerCheckpoint} onComplete={handleTrainerComplete} />
         : practiceOpen
           ? <OpeningPractice onBack={() => setPracticeOpen(false)} lichessConnected={auth.connected} />
           : reviewOpen
-            ? <ChessComReview onBack={() => setReviewOpen(false)} />
-            : <LibraryScreen library={library} auth={auth} syncing={syncing} lastSync={lastSync} libraryError={libraryError} syncReport={syncReport} onSync={handleSync} onTrain={handleTrain} onPractice={handlePractice} onReview={handleReview} />}
-      {busy && !activeChapter && !practiceOpen && !reviewOpen && <div className="busy-overlay" aria-label="불러오는 중"><span /></div>}
+            ? <ChessComReview onBack={() => setReviewOpen(false)} onAddToReview={handleAddToReview} onDrillComplete={handleReviewDrillComplete} onRemoveFromReview={handleRemoveFromReview} queuedPositions={queuedReviewPositions} queuedPositionKeys={queuedPositionKeys} />
+            : <LibraryScreen library={library} auth={auth} trainingState={trainingState} syncing={syncing} lastSync={lastSync} libraryError={libraryError} syncReport={syncReport} onSync={handleSync} onTrain={handleTrain} onResume={handleResume} onTodayReview={handleTodayReview} onPractice={handlePractice} onReview={handleReview} />}
+      {busy && !activeTraining && !practiceOpen && !reviewOpen && <div className="busy-overlay" aria-label="불러오는 중"><span /></div>}
       {toast && <div className={`toast toast-${toast.tone}`} role="status"><Icon name={toast.tone === 'success' ? 'check' : 'target'} />{toast.message}</div>}
     </div>
   );

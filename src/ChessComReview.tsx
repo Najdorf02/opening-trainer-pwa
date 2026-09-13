@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react';
 import { Chessboard, type Arrow } from 'react-chessboard';
+import { Chess, type Color, type Square } from 'chess.js';
 import {
+  aggregateGameReviewTrainingPositions,
   reviewGameAgainstRepertoire,
+  type GameReviewDrillResult,
   type GameRepertoireReview,
   type GameRepertoireReviewStatus,
+  type GameReviewTrainingAggregate,
   type ReviewedGameMove,
 } from '../shared/game-review.js';
 import { getCachedRepertoires, getChessComGames, isApiError } from './api.js';
@@ -11,12 +15,14 @@ import {
   CHESSCOM_TIME_CLASSES,
   filterChessComGames,
   formatGameDate,
+  gradeReviewTrainingMove,
   normalizeChessComUsername,
   plyLabel,
   timeClassLabel,
   type ChessComTimeClass,
 } from './chesscom-review-view.js';
 import { disposeLocalEngine, evaluateLocalMove } from './local-engine.js';
+import { MistakeReview } from './MistakeReview.js';
 import type { ChessComGame, ChessComGamesPayload, OpeningMoveEvaluation } from './types.js';
 
 const DEFAULT_USERNAME = 'Yshaarrj';
@@ -26,6 +32,28 @@ const ALL_TIME_CLASSES = new Set<ChessComTimeClass>(CHESSCOM_TIME_CLASSES);
 interface ReviewedEntry {
   game: ChessComGame;
   review: GameRepertoireReview;
+}
+
+type ReviewDrillPhase = 'awaiting' | 'retry' | 'correct';
+
+interface ReviewDrillState {
+  phase: ReviewDrillPhase;
+  fen: string;
+  wrongAttempts: number;
+  attemptedUcis: string[];
+  trainingPosition: GameReviewTrainingAggregate;
+  gameId: string;
+  origin: 'game' | 'queue';
+  correctMoveUci?: string;
+}
+
+export interface ChessComReviewProps {
+  onBack: () => void;
+  onAddToReview?: (position: GameReviewTrainingAggregate) => void | Promise<void>;
+  onDrillComplete?: (result: GameReviewDrillResult) => void | Promise<void>;
+  onRemoveFromReview?: (positionKey: string) => void | Promise<void>;
+  queuedPositions?: readonly GameReviewTrainingAggregate[];
+  queuedPositionKeys?: ReadonlySet<string>;
 }
 
 type EngineCheck =
@@ -104,6 +132,18 @@ function playerLine(entry: ReviewedEntry): string {
   return `${review.meta.userColor === 'white' ? '백' : '흑'} · vs ${review.meta.opponent.username}${rating}`;
 }
 
+function trainingPositionTitle(position: GameReviewTrainingAggregate): string {
+  const chapter = position.matchingChapters[0];
+  if (!chapter) return '저장한 이탈 포지션';
+  return `${chapter.studyName ?? 'Lichess 연구'} · ${chapter.chapterName}`;
+}
+
+function latestOccurrenceGameId(position: GameReviewTrainingAggregate): string {
+  return [...position.occurrences]
+    .sort((left, right) => (right.playedAt ?? '').localeCompare(left.playedAt ?? ''))[0]
+    ?.gameId ?? `review:${position.positionKey}`;
+}
+
 function ReviewMoveSheet({ review, cursor, onSeek }: {
   review: GameRepertoireReview;
   cursor: number;
@@ -158,7 +198,14 @@ function EngineResult({ state }: { state: EngineCheck }) {
   );
 }
 
-export default function ChessComReview({ onBack }: { onBack: () => void }) {
+export default function ChessComReview({
+  onBack,
+  onAddToReview,
+  onDrillComplete,
+  onRemoveFromReview,
+  queuedPositions = [],
+  queuedPositionKeys,
+}: ChessComReviewProps) {
   const [username, setUsername] = useState(storedUsername);
   const [submittedUsername, setSubmittedUsername] = useState(storedUsername);
   const [months, setMonths] = useState(3);
@@ -173,8 +220,13 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [cursor, setCursor] = useState(0);
   const [engineCheck, setEngineCheck] = useState<EngineCheck>({ status: 'idle' });
+  const [drill, setDrill] = useState<ReviewDrillState | null>(null);
+  const [drillSelected, setDrillSelected] = useState<string | null>(null);
+  const [locallyQueued, setLocallyQueued] = useState<Set<string>>(() => new Set());
+  const [locallyRemoved, setLocallyRemoved] = useState<Set<string>>(() => new Set());
+  const [queueingKey, setQueueingKey] = useState<string | null>(null);
+  const [reviewActionError, setReviewActionError] = useState<string | null>(null);
   const engineAbort = useRef<AbortController | null>(null);
-  const engineWasUsed = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -232,6 +284,31 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
     () => visibleEntries.find((entry) => entry.game.id === selectedId) ?? visibleEntries[0],
     [selectedId, visibleEntries],
   );
+  const trainingPositions = useMemo(
+    () => aggregateGameReviewTrainingPositions(entries.map((entry) => entry.review)),
+    [entries],
+  );
+  const selectedTrainingPosition = useMemo(() => {
+    const positionKey = selected?.review.reviewPosition?.positionKey;
+    return positionKey
+      ? trainingPositions.find((position) => position.positionKey === positionKey)
+      : undefined;
+  }, [selected, trainingPositions]);
+  const savedReviewPositions = useMemo(() => {
+    const byKey = new Map<string, GameReviewTrainingAggregate>();
+    for (const position of queuedPositions) {
+      if (!locallyRemoved.has(position.positionKey)) byKey.set(position.positionKey, position);
+    }
+    return [...byKey.values()];
+  }, [locallyRemoved, queuedPositions]);
+
+  useEffect(() => {
+    const queuedKeys = new Set(queuedPositions.map((position) => position.positionKey));
+    setLocallyRemoved((current) => {
+      const retained = new Set([...current].filter((key) => queuedKeys.has(key)));
+      return retained.size === current.size ? current : retained;
+    });
+  }, [queuedPositions]);
 
   useEffect(() => {
     if (selected && selected.game.id !== selectedId) setSelectedId(selected.game.id);
@@ -243,11 +320,16 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
     engineAbort.current = null;
     setEngineCheck({ status: 'idle' });
     setCursor(selected ? initialCursor(selected.review) : 0);
+    setDrill((current) => current?.origin === 'queue' ? current : null);
+    if (drill?.origin !== 'queue') {
+      setDrillSelected(null);
+      setReviewActionError(null);
+    }
   }, [selected?.game.id]);
 
   useEffect(() => () => {
     engineAbort.current?.abort();
-    if (engineWasUsed.current) disposeLocalEngine();
+    disposeLocalEngine();
   }, []);
 
   const handleSubmit = (event: FormEvent) => {
@@ -279,7 +361,6 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
     engineAbort.current?.abort();
     const controller = new AbortController();
     engineAbort.current = controller;
-    engineWasUsed.current = true;
     setEngineCheck({ status: 'loading' });
     try {
       const result = await evaluateLocalMove({
@@ -295,6 +376,158 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
     }
   }, [engineCheck.status, selected]);
 
+  const handleSeek = useCallback((ply: number) => {
+    setDrill(null);
+    setDrillSelected(null);
+    setReviewActionError(null);
+    setCursor(ply);
+  }, []);
+
+  const startTrainingPosition = useCallback((
+    trainingPosition: GameReviewTrainingAggregate,
+    gameId: string,
+    origin: ReviewDrillState['origin'],
+  ) => {
+    setDrill({
+      phase: 'awaiting',
+      fen: trainingPosition.fen,
+      wrongAttempts: 0,
+      attemptedUcis: [],
+      trainingPosition,
+      gameId,
+      origin,
+    });
+    setDrillSelected(null);
+    setReviewActionError(null);
+  }, []);
+
+  const startReviewDrill = useCallback(() => {
+    const position = selected?.review.reviewPosition;
+    if (!position || !selectedTrainingPosition) return;
+    setCursor(Math.max(0, position.played.ply - 1));
+    startTrainingPosition(selectedTrainingPosition, selected.review.meta.id, 'game');
+  }, [selected, selectedTrainingPosition, startTrainingPosition]);
+
+  const startQueuedReviewDrill = useCallback((position: GameReviewTrainingAggregate) => {
+    startTrainingPosition(position, latestOccurrenceGameId(position), 'queue');
+  }, [startTrainingPosition]);
+
+  const tryReviewDrillMove = useCallback((from: string, to: string | null): boolean => {
+    if (!to || !drill || drill.phase === 'correct') return false;
+    const trainingPosition = drill.trainingPosition;
+    const grade = gradeReviewTrainingMove(
+      trainingPosition.fen,
+      trainingPosition.correctMoves,
+      from,
+      to,
+    );
+    setDrillSelected(null);
+    if (grade.status === 'illegal') {
+      setReviewActionError('합법적인 수를 두세요.');
+      return false;
+    }
+    if (grade.status === 'incorrect') {
+      setDrill((current) => current ? {
+        ...current,
+        phase: 'retry',
+        fen: trainingPosition.fen,
+        wrongAttempts: current.wrongAttempts + 1,
+        attemptedUcis: [...current.attemptedUcis, grade.uci],
+        correctMoveUci: undefined,
+      } : current);
+      setReviewActionError(null);
+      return false;
+    }
+
+    const wrongAttempts = drill.wrongAttempts;
+    setDrill({
+      phase: 'correct',
+      fen: grade.fenAfter,
+      wrongAttempts,
+      attemptedUcis: [...drill.attemptedUcis, grade.uci],
+      trainingPosition,
+      gameId: drill.gameId,
+      origin: drill.origin,
+      correctMoveUci: grade.uci,
+    });
+    setReviewActionError(null);
+    const result: GameReviewDrillResult = {
+      source: 'chesscom-review',
+      positionKey: trainingPosition.positionKey,
+      gameId: drill.gameId,
+      trainingPosition,
+      correctMove: {
+        moveId: grade.candidate.moveId,
+        ...(grade.candidate.cardId ? { cardId: grade.candidate.cardId } : {}),
+        uci: grade.candidate.uci,
+        san: grade.candidate.san,
+      },
+      wrongAttempts,
+      firstTryCorrect: wrongAttempts === 0,
+      completedAt: new Date().toISOString(),
+    };
+    try {
+      void Promise.resolve(onDrillComplete?.(result)).then(async () => {
+        if (drill.origin !== 'queue') return;
+        // App's completion callback normally persists the result and removes the
+        // queue entry atomically. Keep the explicit remover only as a fallback
+        // for an embedding that did not provide that callback.
+        if (!onDrillComplete && onRemoveFromReview) {
+          await onRemoveFromReview(trainingPosition.positionKey);
+        }
+        setLocallyRemoved((current) => new Set(current).add(trainingPosition.positionKey));
+        setLocallyQueued((current) => {
+          const next = new Set(current);
+          next.delete(trainingPosition.positionKey);
+          return next;
+        });
+      }).catch((error: unknown) => {
+        setReviewActionError(error instanceof Error ? error.message : '훈련 결과를 저장하지 못했습니다.');
+      });
+    } catch (error) {
+      setReviewActionError(error instanceof Error ? error.message : '훈련 결과를 저장하지 못했습니다.');
+    }
+    return true;
+  }, [drill, onDrillComplete, onRemoveFromReview]);
+
+  const handleDrillSquareClick = useCallback(({ square }: { square: string }) => {
+    if (!drill || drill.phase === 'correct') return;
+    const game = new Chess(drill.trainingPosition.fen);
+    const piece = game.get(square as Square);
+    const userColor: Color = drill.trainingPosition.userColor === 'white' ? 'w' : 'b';
+    if (!drillSelected) {
+      if (piece?.color === userColor) setDrillSelected(square);
+      return;
+    }
+    if (piece?.color === userColor) {
+      setDrillSelected(square);
+      return;
+    }
+    tryReviewDrillMove(drillSelected, square);
+  }, [drill, drillSelected, tryReviewDrillMove]);
+
+  const handleAddToReview = useCallback(async () => {
+    if (!selectedTrainingPosition) return;
+    const key = selectedTrainingPosition.positionKey;
+    if (locallyQueued.has(key) || queuedPositionKeys?.has(key) || queueingKey === key) return;
+    setQueueingKey(key);
+    setReviewActionError(null);
+    try {
+      await onAddToReview?.(selectedTrainingPosition);
+      setLocallyQueued((current) => new Set(current).add(key));
+      setLocallyRemoved((current) => {
+        if (!current.has(key)) return current;
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+    } catch (error) {
+      setReviewActionError(error instanceof Error ? error.message : '복습 목록에 저장하지 못했습니다.');
+    } finally {
+      setQueueingKey((current) => current === key ? null : current);
+    }
+  }, [locallyQueued, onAddToReview, queuedPositionKeys, queueingKey, selectedTrainingPosition]);
+
   const counts = useMemo(() => ({
     deviation: visibleEntries.filter((entry) => entry.review.status === 'user-deviation').length,
     covered: visibleEntries.filter((entry) => entry.review.status === 'in-repertoire').length,
@@ -302,20 +535,44 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
     coverageEnded: visibleEntries.filter((entry) => entry.review.status === 'coverage-ended').length,
   }), [visibleEntries]);
 
-  const boardFen = selected
+  const replayBoardFen = selected
     ? cursor <= 0 ? selected.review.initialFen : selected.review.moves[Math.min(cursor, selected.review.moves.length) - 1]?.afterFen ?? selected.review.initialFen
     : 'start';
+  const boardFen = drill?.fen ?? replayBoardFen;
   const deviation = selected?.review.firstDeviation;
   const isBeforeDeviation = Boolean(deviation && cursor === deviation.ply - 1);
   const arrows = useMemo(() => {
+    if (drill) {
+      if (drill.phase === 'retry') {
+        return drill.trainingPosition.correctMoves.slice(0, 3)
+          .map((move) => uciArrow(move.uci, '#4fcbb2'))
+          .filter((arrow): arrow is Arrow => Boolean(arrow));
+      }
+      if (drill.phase === 'correct' && drill.correctMoveUci) {
+        const correct = uciArrow(drill.correctMoveUci, '#4fcbb2');
+        return correct ? [correct] : [];
+      }
+      return [];
+    }
     if (!deviation || !isBeforeDeviation) return [];
     const expected = deviation.expectedMoves.slice(0, 3)
       .map((move) => uciArrow(move.uci, '#4fcbb2'))
       .filter((arrow): arrow is Arrow => Boolean(arrow));
     const played = uciArrow(deviation.played.uci, selected?.review.status === 'coverage-ended' ? '#8e9daf' : '#ed695d');
     return played ? [...expected, played] : expected;
-  }, [deviation, isBeforeDeviation, selected?.review.status]);
+  }, [deviation, drill, isBeforeDeviation, selected?.review.status]);
   const squareStyles = useMemo(() => {
+    if (drill) {
+      const styles: Record<string, CSSProperties> = {};
+      if (drillSelected) {
+        styles[drillSelected] = { boxShadow: 'inset 0 0 0 5px rgba(233,183,94,.9)' };
+      }
+      if (drill.phase === 'correct' && drill.correctMoveUci) {
+        styles[drill.correctMoveUci.slice(0, 2)] = { background: 'rgba(79,203,178,.5)' };
+        styles[drill.correctMoveUci.slice(2, 4)] = { background: 'rgba(79,203,178,.64)' };
+      }
+      return styles;
+    }
     if (!deviation || !isBeforeDeviation) return {};
     const styles: Record<string, CSSProperties> = {};
     for (const expected of deviation.expectedMoves.slice(0, 3)) {
@@ -327,7 +584,23 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
         : 'inset 0 0 0 5px rgba(237,105,93,.78)',
     };
     return styles;
-  }, [deviation, isBeforeDeviation, selected?.review.status]);
+  }, [deviation, drill, drillSelected, isBeforeDeviation, selected?.review.status]);
+  const canDrillMove = Boolean(drill && drill.phase !== 'correct');
+  const reviewQueued = Boolean(selectedTrainingPosition && (
+    locallyQueued.has(selectedTrainingPosition.positionKey) ||
+    queuedPositionKeys?.has(selectedTrainingPosition.positionKey) ||
+    savedReviewPositions.some((position) => position.positionKey === selectedTrainingPosition.positionKey)
+  ));
+  const reviewQueueing = Boolean(selectedTrainingPosition && queueingKey === selectedTrainingPosition.positionKey);
+  const queuedDrill = drill?.origin === 'queue' ? drill : null;
+  const nextSavedReviewPosition = queuedDrill
+    ? savedReviewPositions.find((position) => position.positionKey !== queuedDrill.trainingPosition.positionKey)
+    : undefined;
+  const closeQueuedReviewDrill = () => {
+    setDrill(null);
+    setDrillSelected(null);
+    setReviewActionError(null);
+  };
 
   return (
     <main className="review-shell">
@@ -349,15 +622,166 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
         </div>
       </section>
 
-      {loading && <section className="review-state-card" aria-live="polite"><span className="review-spinner" /><h2>최근 대국을 레퍼토리와 맞추는 중</h2><p>Chess.com 공개 기록과 이 기기에 동기화된 Lichess 연구를 읽고 있어요.</p></section>}
+      {!queuedDrill && savedReviewPositions.length > 0 && (
+        <section className="review-control-card" aria-label="저장한 복습">
+          <div className="review-speed-filter">
+            <span>저장한 복습 · {savedReviewPositions.length}개</span>
+            {savedReviewPositions.slice(0, 4).map((position, index) => (
+              <button
+                key={position.positionKey}
+                type="button"
+                title={trainingPositionTitle(position)}
+                onClick={() => startQueuedReviewDrill(position)}
+              >{index + 1}. {position.matchingChapters[0]?.chapterName ?? '이탈 포지션'}</button>
+            ))}
+          </div>
+          <button className="button button-primary" type="button" onClick={() => startQueuedReviewDrill(savedReviewPositions[0])}>
+            저장한 복습 시작
+          </button>
+        </section>
+      )}
 
-      {!loading && loadError && <section className="review-state-card is-error" role="alert"><span className="review-state-symbol">!</span><h2>대국을 불러오지 못했습니다</h2><p>{loadError}</p><button className="button button-secondary" type="button" onClick={() => setReload((value) => value + 1)}>다시 시도</button></section>}
+      {queuedDrill && (
+        <div className="review-workspace">
+          <aside className="review-game-list" aria-label="저장한 복습 목록">
+            <div className="review-pane-heading">
+              <span>저장한 복습</span>
+              <small>{savedReviewPositions.length}개 남음 · 원하는 포지션을 선택하세요</small>
+            </div>
+            <div className="review-game-scroll">
+              {savedReviewPositions.length === 0 && (
+                <p className="review-placeholder">저장한 복습을 모두 완료했습니다.</p>
+              )}
+              {savedReviewPositions.map((position, index) => {
+                const selectedPosition = position.positionKey === queuedDrill.trainingPosition.positionKey;
+                return (
+                  <button
+                    className={`review-game-card ${selectedPosition ? 'is-selected' : ''}`}
+                    type="button"
+                    key={position.positionKey}
+                    onClick={() => startQueuedReviewDrill(position)}
+                    aria-pressed={selectedPosition}
+                  >
+                    <span className="review-game-card-top">
+                      <b className="review-result is-loss">{index + 1}</b>
+                      <time>{position.userColor === 'white' ? '백 레퍼토리' : '흑 레퍼토리'}</time>
+                      <i>{position.occurrenceCount}회</i>
+                    </span>
+                    <strong title={trainingPositionTitle(position)}>{trainingPositionTitle(position)}</strong>
+                    <span className="review-status-badge is-coral">준비한 대응 다시 두기</span>
+                  </button>
+                );
+              })}
+            </div>
+          </aside>
 
-      {!loading && !loadError && cacheMissing && <section className="review-state-card is-warning"><span className="review-state-symbol">♙</span><h2>먼저 Lichess 연구를 동기화해 주세요</h2><p>실전 수와 대조할 서버 캐시가 비어 있습니다. 라이브러리에서 연구를 한 번 동기화한 뒤 돌아오세요.</p><button className="button button-secondary" type="button" onClick={onBack}>라이브러리로 돌아가기</button></section>}
+          <section className="review-board-pane">
+            <div className="review-board-heading">
+              <div>
+                <span>{queuedDrill.trainingPosition.userColor === 'white' ? '백' : '흑'} · 저장한 복습</span>
+                <strong>{trainingPositionTitle(queuedDrill.trainingPosition)}</strong>
+              </div>
+            </div>
+            <div className={`review-board-frame phase-${queuedDrill.phase}`}>
+              <Chessboard options={{
+                id: `queued-review-${queuedDrill.trainingPosition.positionKey}`,
+                position: queuedDrill.fen,
+                boardOrientation: queuedDrill.trainingPosition.userColor,
+                allowDragging: canDrillMove,
+                allowDrawingArrows: false,
+                showNotation: true,
+                showAnimations: true,
+                animationDurationInMs: 220,
+                arrows,
+                squareStyles,
+                darkSquareStyle: { backgroundColor: '#567577' },
+                lightSquareStyle: { backgroundColor: '#d9ded3' },
+                boardStyle: { borderRadius: '7px', boxShadow: '0 20px 50px rgba(0,0,0,.28)' },
+                canDragPiece: ({ square }: { square: string | null }) => {
+                  if (!square || !canDrillMove) return false;
+                  const color: Color = queuedDrill.trainingPosition.userColor === 'white' ? 'w' : 'b';
+                  return new Chess(queuedDrill.trainingPosition.fen).get(square as Square)?.color === color;
+                },
+                onPieceDrop: ({ sourceSquare, targetSquare }: { sourceSquare: string; targetSquare: string | null }) => tryReviewDrillMove(sourceSquare, targetSquare),
+                onSquareClick: handleDrillSquareClick,
+              }} />
+            </div>
+            <div className="review-board-nav">
+              <button type="button" disabled aria-hidden="true">|‹</button>
+              <button type="button" disabled aria-hidden="true">‹</button>
+              <span>이탈 직전 위치<small>{queuedDrill.trainingPosition.occurrenceCount}회 발견</small></span>
+              <button type="button" disabled aria-hidden="true">›</button>
+              <button type="button" disabled aria-hidden="true">›|</button>
+            </div>
+            <button className="review-jump-button is-neutral" type="button" onClick={closeQueuedReviewDrill}>대국 복기로 돌아가기</button>
+          </section>
 
-      {!loading && !loadError && !cacheMissing && entries.length === 0 && <section className="review-state-card"><span className="review-state-symbol">♟</span><h2>분석할 공개 대국이 없습니다</h2><p>선택한 기간에 표준 체스 대국이 없거나 PGN을 읽을 수 없었습니다.</p></section>}
+          <aside className="review-detail-pane">
+            <div className="review-pane-heading">
+              <span>저장한 포지션 훈련</span>
+              <small>정답을 직접 둔 뒤 완료됩니다</small>
+            </div>
+            <div className="review-detail-scroll">
+              <div className="review-finding is-coral">
+                <span>반복 이탈 {queuedDrill.trainingPosition.occurrenceCount}회</span>
+                <h2>{queuedDrill.trainingPosition.userColor === 'white' ? '백' : '흑'} 차례</h2>
+                <p>이 포지션에 등록된 레퍼토리 대응을 보드에서 두세요.</p>
+              </div>
 
-      {!loading && !loadError && !cacheMissing && entries.length > 0 && (
+              <div className="review-engine-card review-drill-card">
+                <span>Active recall</span>
+                {queuedDrill.phase === 'awaiting' && (
+                  <div className="review-engine-result is-loading" role="status">
+                    <strong>내 차례</strong>
+                    <span>정답은 숨겨 두었습니다. 기물을 드래그하거나 칸을 눌러 수를 두세요.</span>
+                  </div>
+                )}
+                {queuedDrill.phase === 'retry' && (
+                  <div className="review-engine-result is-fail" role="alert">
+                    <strong>다른 수입니다 · 직접 다시 두세요</strong>
+                    <span>정답 {queuedDrill.trainingPosition.correctMoves.map((move) => move.san).join(' · ')}를 확인했습니다. 같은 포지션에서 맞는 수를 두어야 완료됩니다.</span>
+                  </div>
+                )}
+                {queuedDrill.phase === 'correct' && (
+                  <div className="review-engine-result is-pass" role="status">
+                    <strong>정답입니다</strong>
+                    <span>{queuedDrill.wrongAttempts ? `오답 ${queuedDrill.wrongAttempts}회 뒤 직접 다시 찾았습니다.` : '첫 시도에 정확히 찾았습니다.'}</span>
+                  </div>
+                )}
+                {reviewActionError && (
+                  <div className="review-engine-result is-error" role="alert">
+                    <strong>저장 알림</strong><span>{reviewActionError}</span>
+                  </div>
+                )}
+              </div>
+
+              {queuedDrill.trainingPosition.matchingChapters.map((chapter) => (
+                <div className="review-match-card" key={`${chapter.studyId}:${chapter.chapterId}`}>
+                  <span>등록된 레퍼토리</span>
+                  <strong>{chapter.studyName ?? 'Lichess 연구'} · {chapter.chapterName}</strong>
+                  {chapter.sourceUrl && <a href={chapter.sourceUrl} target="_blank" rel="noreferrer">Lichess 연구 열기 ↗</a>}
+                </div>
+              ))}
+
+              {queuedDrill.phase === 'correct' && nextSavedReviewPosition && (
+                <button className="button button-primary" type="button" onClick={() => startQueuedReviewDrill(nextSavedReviewPosition)}>
+                  다음 저장 복습
+                </button>
+              )}
+            </div>
+          </aside>
+        </div>
+      )}
+
+      {!queuedDrill && loading && <section className="review-state-card" aria-live="polite"><span className="review-spinner" /><h2>최근 대국을 레퍼토리와 맞추는 중</h2><p>Chess.com 공개 기록과 이 기기에 동기화된 Lichess 연구를 읽고 있어요.</p></section>}
+
+      {!queuedDrill && !loading && loadError && <section className="review-state-card is-error" role="alert"><span className="review-state-symbol">!</span><h2>대국을 불러오지 못했습니다</h2><p>{loadError}</p><button className="button button-secondary" type="button" onClick={() => setReload((value) => value + 1)}>다시 시도</button></section>}
+
+      {!queuedDrill && !loading && !loadError && cacheMissing && <section className="review-state-card is-warning"><span className="review-state-symbol">♙</span><h2>먼저 Lichess 연구를 동기화해 주세요</h2><p>실전 수와 대조할 서버 캐시가 비어 있습니다. 라이브러리에서 연구를 한 번 동기화한 뒤 돌아오세요.</p><button className="button button-secondary" type="button" onClick={onBack}>라이브러리로 돌아가기</button></section>}
+
+      {!queuedDrill && !loading && !loadError && !cacheMissing && entries.length === 0 && <section className="review-state-card"><span className="review-state-symbol">♟</span><h2>분석할 공개 대국이 없습니다</h2><p>선택한 기간에 표준 체스 대국이 없거나 PGN을 읽을 수 없었습니다.</p></section>}
+
+      {!queuedDrill && !loading && !loadError && !cacheMissing && entries.length > 0 && (
         <>
           <section className="review-summary" aria-live="polite">
             <div><small>필터 결과</small><strong>{visibleEntries.length}<span>국</span></strong></div>
@@ -390,11 +814,11 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
                   <div><span>{selected.review.meta.userColor === 'white' ? '백' : '흑'} · {resultCopy(selected.review.meta.result)}</span><strong>{selected.review.meta.user.username} vs {selected.review.meta.opponent.username}</strong></div>
                   <a href={selected.game.url} target="_blank" rel="noreferrer">Chess.com에서 보기 ↗</a>
                 </div>
-                <div className="review-board-frame"><Chessboard options={{
+                <div className={`review-board-frame${drill ? ` phase-${drill.phase}` : ''}`}><Chessboard options={{
                   id: `review-${selected.game.id}`,
                   position: boardFen,
-                  boardOrientation: selected.review.meta.userColor,
-                  allowDragging: false,
+                  boardOrientation: drill?.trainingPosition.userColor ?? selected.review.meta.userColor,
+                  allowDragging: canDrillMove,
                   allowDrawingArrows: false,
                   showNotation: true,
                   showAnimations: true,
@@ -404,21 +828,28 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
                   darkSquareStyle: { backgroundColor: '#567577' },
                   lightSquareStyle: { backgroundColor: '#d9ded3' },
                   boardStyle: { borderRadius: '7px', boxShadow: '0 20px 50px rgba(0,0,0,.28)' },
+                  canDragPiece: ({ square }: { square: string | null }) => {
+                    if (!square || !canDrillMove || !drill) return false;
+                    const color: Color = drill.trainingPosition.userColor === 'white' ? 'w' : 'b';
+                    return new Chess(drill.trainingPosition.fen).get(square as Square)?.color === color;
+                  },
+                  onPieceDrop: ({ sourceSquare, targetSquare }: { sourceSquare: string; targetSquare: string | null }) => tryReviewDrillMove(sourceSquare, targetSquare),
+                  onSquareClick: handleDrillSquareClick,
                 }} /></div>
                 <div className="review-board-nav">
-                  <button type="button" onClick={() => setCursor(0)} disabled={cursor === 0} aria-label="처음 위치">|‹</button>
-                  <button type="button" onClick={() => setCursor((value) => Math.max(0, value - 1))} disabled={cursor === 0} aria-label="이전 수">‹</button>
+                  <button type="button" onClick={() => handleSeek(0)} disabled={cursor === 0 && !drill} aria-label="처음 위치">|‹</button>
+                  <button type="button" onClick={() => handleSeek(Math.max(0, cursor - 1))} disabled={cursor === 0 && !drill} aria-label="이전 수">‹</button>
                   <span>{cursor === 0 ? '시작 위치' : `${plyLabel(cursor)} ${selected.review.moves[cursor - 1]?.san ?? ''}`}<small>{cursor} / {selected.review.moves.length}</small></span>
-                  <button type="button" onClick={() => setCursor((value) => Math.min(selected.review.moves.length, value + 1))} disabled={cursor >= selected.review.moves.length} aria-label="다음 수">›</button>
-                  <button type="button" onClick={() => setCursor(selected.review.moves.length)} disabled={cursor >= selected.review.moves.length} aria-label="마지막 위치">›|</button>
+                  <button type="button" onClick={() => handleSeek(Math.min(selected.review.moves.length, cursor + 1))} disabled={cursor >= selected.review.moves.length && !drill} aria-label="다음 수">›</button>
+                  <button type="button" onClick={() => handleSeek(selected.review.moves.length)} disabled={cursor >= selected.review.moves.length && !drill} aria-label="마지막 위치">›|</button>
                 </div>
-                {deviation && !isBeforeDeviation && <button className={`review-jump-button ${selected.review.status === 'coverage-ended' ? 'is-neutral' : ''}`} type="button" onClick={() => setCursor(deviation.ply - 1)}>{selected.review.status === 'coverage-ended' ? '연구가 끝난 지점으로 이동' : '첫 이탈 직전으로 이동'}</button>}
+                {deviation && !isBeforeDeviation && <button className={`review-jump-button ${selected.review.status === 'coverage-ended' ? 'is-neutral' : ''}`} type="button" onClick={() => handleSeek(deviation.ply - 1)}>{selected.review.status === 'coverage-ended' ? '연구가 끝난 지점으로 이동' : '첫 이탈 직전으로 이동'}</button>}
               </section>}
 
               {selected && <aside className="review-detail-pane">
                 <div className="review-pane-heading"><span>대국 상세</span><small>{selected.review.meta.opening ?? selected.review.meta.eco ?? 'Opening review'}</small></div>
                 <div className="review-detail-scroll">
-                  <ReviewMoveSheet review={selected.review} cursor={cursor} onSeek={setCursor} />
+                  <ReviewMoveSheet review={selected.review} cursor={cursor} onSeek={handleSeek} />
                   <div className={`review-finding is-${statusCopy(selected.review.status).tone}`}>
                     <span>{statusCopy(selected.review.status).label}</span>
                     <h2>{deviation ? `${plyLabel(deviation.ply)} ${deviation.played.san}` : statusCopy(selected.review.status).label}</h2>
@@ -430,11 +861,38 @@ export default function ChessComReview({ onBack }: { onBack: () => void }) {
 
                   {deviation?.kind === 'user-deviation' && <div className="review-expected">
                     <div><span>내가 둔 수</span><strong className="is-played">{deviation.played.san}</strong></div>
-                    <div><span>준비한 대응</span><p>{deviation.expectedMoves.length ? deviation.expectedMoves.map((move) => <button key={move.moveId} type="button" onClick={() => setCursor(deviation.ply - 1)} title="보드에서 화살표 보기">{move.san}</button>) : <em>연구 라인 종료</em>}</p></div>
+                    <div><span>준비한 대응</span><p>{deviation.expectedMoves.length ? deviation.expectedMoves.map((move) => <button key={move.moveId} type="button" onClick={() => handleSeek(deviation.ply - 1)} title="보드에서 화살표 보기">{move.san}</button>) : <em>연구 라인 종료</em>}</p></div>
                     {deviation.expectedMoves.flatMap((move) => move.annotations.comments).slice(0, 2).map((comment, index) => <blockquote key={`${index}:${comment}`}>{comment}</blockquote>)}
                   </div>}
 
+                  {selectedTrainingPosition && <div className="review-engine-card review-drill-card">
+                    <span>이탈 지점 바로 훈련</span>
+                    <p>{selectedTrainingPosition.occurrenceCount > 1
+                      ? `최근 대국에서 같은 포지션을 ${selectedTrainingPosition.occurrenceCount}번 놓쳤습니다. 준비한 대응을 보드에서 다시 두어 보세요.`
+                      : '실수 직전 포지션에서 준비한 대응을 보드에 직접 두어 보세요.'}</p>
+                    <div className="review-drill-actions">
+                      <button
+                        className="button button-primary"
+                        type="button"
+                        disabled={Boolean(drill && drill.phase !== 'correct')}
+                        onClick={startReviewDrill}
+                      >{drill?.phase === 'correct' ? '다시 풀기' : drill ? '훈련 중…' : '지금 다시 두기'}</button>
+                      <button
+                        className="button button-secondary"
+                        type="button"
+                        disabled={reviewQueued || reviewQueueing}
+                        onClick={() => void handleAddToReview()}
+                      >{reviewQueueing ? '추가 중…' : reviewQueued ? '복습 목록에 추가됨' : '복습 목록에 추가'}</button>
+                    </div>
+                    {drill?.phase === 'awaiting' && <div className="review-engine-result is-loading" role="status"><strong>내 차례</strong><span>정답 표시는 숨겨 두었습니다. 기물을 드래그하거나 칸을 눌러 수를 두세요.</span></div>}
+                    {drill?.phase === 'retry' && <div className="review-engine-result is-fail" role="alert"><strong>다른 수입니다 · 다시 시도</strong><span>정답 {selectedTrainingPosition.correctMoves.map((move) => move.san).join(' · ')}를 확인한 뒤 같은 포지션에서 직접 두세요.</span></div>}
+                    {drill?.phase === 'correct' && <div className="review-engine-result is-pass" role="status"><strong>정답입니다</strong><span>{drill.wrongAttempts ? `오답 ${drill.wrongAttempts}회 뒤 직접 다시 찾았습니다.` : '첫 시도에 정확히 찾았습니다.'}</span></div>}
+                    {reviewActionError && <div className="review-engine-result is-error" role="alert"><strong>저장 알림</strong><span>{reviewActionError}</span></div>}
+                  </div>}
+
                   {selected.review.match && <div className="review-match-card"><span>가장 오래 일치한 챕터</span><strong>{selected.review.match.studyName ?? 'Lichess 연구'} · {selected.review.match.chapterName}</strong><small>{selected.review.matchedPlies}플라이 · 내 수 {selected.review.matchedUserMoves}회 일치</small>{selected.review.match.sourceUrl && <a href={selected.review.match.sourceUrl} target="_blank" rel="noreferrer">Lichess 연구 열기 ↗</a>}</div>}
+
+                  <MistakeReview review={selected.review} onShowPosition={handleSeek} />
 
                   {selected.review.firstUserDeviation && <div className="review-engine-card">
                     <span>레퍼토리 밖이어도 좋은 수였을까요?</span>

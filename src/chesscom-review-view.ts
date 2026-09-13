@@ -1,3 +1,5 @@
+import { Chess, type Square } from 'chess.js';
+import type { RepertoireReviewMoveCandidate } from '../shared/game-review.js';
 import type { ChessComGame } from './types.js';
 
 export const CHESSCOM_TIME_CLASSES = ['bullet', 'blitz', 'rapid', 'daily'] as const;
@@ -62,4 +64,51 @@ export function formatGameDate(endTime: number): string {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+export type ReviewTrainingMoveGrade =
+  | { status: 'illegal' }
+  | {
+      status: 'incorrect';
+      uci: string;
+      san: string;
+    }
+  | {
+      status: 'correct';
+      uci: string;
+      san: string;
+      fenAfter: string;
+      candidate: RepertoireReviewMoveCandidate;
+    };
+
+/** Grade one direct-retry move against every response registered at the position. */
+export function gradeReviewTrainingMove(
+  fen: string,
+  correctMoves: readonly RepertoireReviewMoveCandidate[],
+  from: string,
+  to: string,
+): ReviewTrainingMoveGrade {
+  const prefix = `${from}${to}`.toLowerCase();
+  const registeredPromotion = correctMoves.find((move) => move.uci.toLowerCase().startsWith(prefix))
+    ?.uci.slice(4, 5);
+  const game = new Chess(fen);
+  try {
+    const move = game.move({
+      from: from as Square,
+      to: to as Square,
+      promotion: registeredPromotion || 'q',
+    });
+    const uci = `${move.from}${move.to}${move.promotion ?? ''}`.toLowerCase();
+    const candidate = correctMoves.find((expected) => expected.uci.toLowerCase() === uci);
+    if (!candidate) return { status: 'incorrect', uci, san: move.san };
+    return {
+      status: 'correct',
+      uci,
+      san: move.san,
+      fenAfter: game.fen(),
+      candidate,
+    };
+  } catch {
+    return { status: 'illegal' };
+  }
 }

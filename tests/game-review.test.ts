@@ -2,6 +2,7 @@ import { Chess } from "chess.js";
 import { describe, expect, it } from "vitest";
 
 import {
+  aggregateGameReviewTrainingPositions,
   GameReviewError,
   identifyUserColor,
   importLichessStudyPgn,
@@ -371,5 +372,66 @@ describe("Chess.com repertoire game review", () => {
       replay.move(move.uci);
       expect(move.afterFen).toBe(replay.fen());
     }
+  });
+
+  it("aggregates repeated user lapses and excludes opponent novelties", () => {
+    const source = repertoire("1. e4 c5 2. Nf3 d6 3. d4 *", {
+      studyId: "najdorf-study",
+      chapterId: "main-line",
+      chapterName: "Najdorf main line",
+    });
+    const first = reviewGameAgainstRepertoire(
+      game("1. e4 c5 2. Nf3 d6 3. Bb5+ 1-0", {
+        id: "lapse-1",
+        playedAt: "2026-08-31T00:00:00.000Z",
+      }),
+      "Yshaarrj",
+      [source],
+    );
+    const repeated = reviewGameAgainstRepertoire(
+      game("1. e4 c5 2. Nf3 d6 3. Bc4 1-0", {
+        id: "lapse-2",
+        playedAt: "2026-09-01T00:00:00.000Z",
+      }),
+      "Yshaarrj",
+      [source],
+    );
+    const opponentNovelty = reviewGameAgainstRepertoire(
+      game("1. e4 c5 2. Bc4 1-0", {
+        id: "opponent-new-move",
+        white: { username: "Opponent", result: "win" },
+        black: { username: "Yshaarrj", result: "resigned" },
+      }),
+      "Yshaarrj",
+      [repertoire("1. e4 c5 2. Nf3 d6 *", {
+        studyId: "black-study",
+        chapterId: "black-main",
+        orientation: "black",
+      })],
+    );
+
+    const aggregates = aggregateGameReviewTrainingPositions([
+      first,
+      repeated,
+      opponentNovelty,
+    ]);
+
+    expect(aggregates).toHaveLength(1);
+    expect(aggregates[0]).toMatchObject({
+      source: "chesscom-review",
+      userColor: "white",
+      occurrenceCount: 2,
+      correctMoves: [{ uci: "d2d4" }],
+      matchingChapters: [{
+        studyId: "najdorf-study",
+        chapterId: "main-line",
+        chapterName: "Najdorf main line",
+      }],
+      occurrences: [
+        { gameId: "lapse-1", playedMove: { uci: "f1b5" } },
+        { gameId: "lapse-2", playedMove: { uci: "f1c4" } },
+      ],
+    });
+    expect(aggregates[0]?.correctMoves[0]?.cardId).toBeTruthy();
   });
 });

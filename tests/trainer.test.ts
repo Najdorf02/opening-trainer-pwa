@@ -4,6 +4,8 @@ import {
   ChapterTrainer,
   importLichessStudyPgn,
   type RepertoireChapter,
+  TrainerSessionRestoreError,
+  type TrainerSessionRestoreErrorCode,
   type TrainerTransition,
 } from "../shared/index.js";
 
@@ -45,6 +47,19 @@ function playCurrentLineCleanly(
   expect(transition.snapshot.status).toBe("line-complete");
   expect(chapter.lines.length).toBeGreaterThan(0);
   return transition;
+}
+
+function expectRestoreError(
+  restore: () => unknown,
+  code: TrainerSessionRestoreErrorCode,
+): void {
+  try {
+    restore();
+    throw new Error("Expected restore to fail.");
+  } catch (error) {
+    expect(error).toBeInstanceOf(TrainerSessionRestoreError);
+    expect((error as TrainerSessionRestoreError).code).toBe(code);
+  }
 }
 
 describe("ChapterTrainer", () => {
@@ -270,5 +285,208 @@ describe("ChapterTrainer", () => {
     trainer.submitUserMove("e2e4", 90);
     expect(trainer.getSnapshot().reviewRemaining).toBe(0);
     expect(trainer.continue(100).snapshot.status).toBe("complete");
+  });
+
+  it("restores a mid-line prompt with attempts, grades, and paused response time", () => {
+    const chapter = makeChapter("1. e4 e5 2. Nf3 Nc6 *");
+    const trainer = new ChapterTrainer(chapter);
+    trainer.start(100);
+    const beforeSave = expectPrompt(trainer.submitUserMove("e2e4", 150), "g1f3");
+
+    const checkpoint = trainer.exportSession(180);
+    const restored = ChapterTrainer.restoreSession(
+      chapter,
+      JSON.stringify(checkpoint),
+      1_000,
+    );
+
+    expect(restored.getSnapshot()).toEqual(beforeSave.snapshot);
+    expect(restored.getAttempts()).toEqual(trainer.getAttempts());
+    expect(restored.getSessionCardGrades()).toEqual(
+      trainer.getSessionCardGrades(),
+    );
+
+    const finished = restored.submitUserMove("g1f3", 1_050);
+    expect(finished.snapshot.status).toBe("line-complete");
+    expect(restored.getAttempts().at(-1)).toMatchObject({
+      playedUci: "g1f3",
+      outcome: "target-correct",
+      elapsedMs: 80,
+    });
+    expect(restored.continue(1_060).snapshot.status).toBe("complete");
+  });
+
+  it("restores a revealed correction and keeps the mandatory retry", () => {
+    const chapter = makeChapter(
+      "1. e4 (1. d4 $2 {Original warning.}) e5 2. Nf3 Nc6 *",
+    );
+    const trainer = new ChapterTrainer(chapter);
+    trainer.start(100);
+    trainer.submitUserMove("d2d4", 120);
+    const checkpoint = trainer.exportSession(130);
+
+    const refreshedChapter = structuredClone(chapter);
+    const avoidMove = Object.values(refreshedChapter.moves).find(
+      (move) => move.trainingRole === "avoid",
+    )!;
+    avoidMove.annotations.comments = ["Updated warning."];
+    refreshedChapter.name = "Renamed chapter";
+
+    const restored = ChapterTrainer.restoreSession(
+      refreshedChapter,
+      checkpoint,
+      1_000,
+    );
+    expect(restored.getSnapshot()).toMatchObject({
+      status: "showing-correction",
+      correction: {
+        playedUci: "d2d4",
+        knownAvoidMove: {
+          annotations: { comments: ["Updated warning."] },
+        },
+      },
+    });
+
+    const retry = restored.acknowledgeCorrection(1_010);
+    expect(retry.snapshot.prompt).toMatchObject({
+      retry: true,
+      target: { uci: "e2e4" },
+    });
+    expectPrompt(restored.submitUserMove("e2e4", 1_020), "g1f3");
+    expect(restored.getSessionCardGrades()[0].grade).toBe("again");
+  });
+
+  it("restores all dirty lines and the remaining mistake-review queue", () => {
+    const chapter = makeChapter("1. e4 (1. d4 d5) e5 *");
+    let trainer = new ChapterTrainer(chapter);
+    trainer.start(0);
+
+    trainer.submitUserMove("c2c4", 10);
+    trainer.acknowledgeCorrection(20);
+    trainer.submitUserMove("e2e4", 30);
+    expectPrompt(trainer.continue(40), "d2d4");
+    trainer.submitUserMove("c2c4", 50);
+    trainer.acknowledgeCorrection(60);
+    trainer.submitUserMove("d2d4", 70);
+
+    trainer = ChapterTrainer.restoreSession(chapter, trainer.exportSession(75), 100);
+    const firstReview = expectPrompt(trainer.continue(110), "e2e4");
+    expect(firstReview.snapshot).toMatchObject({
+      phase: "mistake-review",
+      reviewRemaining: 2,
+      mistakeLineIds: chapter.lines.map((line) => line.id),
+    });
+    trainer.submitUserMove("e2e4", 120);
+
+    trainer = ChapterTrainer.restoreSession(chapter, trainer.exportSession(125), 200);
+    const secondReview = expectPrompt(trainer.continue(210), "d2d4");
+    expect(secondReview.snapshot).toMatchObject({
+      phase: "mistake-review",
+      reviewRemaining: 1,
+    });
+    trainer.submitUserMove("d2d4", 220);
+    expect(trainer.continue(230).snapshot.status).toBe("complete");
+  });
+
+  it("restores an in-progress repertoire alternative without changing its semantics", () => {
+    const chapter = makeChapter(
+      "1. e4 e5 2. Nf3 (2. Bc4 Nc6 3. Nf3) Nc6 *",
+    );
+    const trainer = new ChapterTrainer(chapter);
+    trainer.start(100);
+    expectPrompt(trainer.submitUserMove("e2e4", 110), "g1f3");
+    const alternative = expectPrompt(
+      trainer.submitUserMove("f1c4", 120),
+      "g1f3",
+    );
+    expect(alternative.events[0]).toMatchObject({
+      type: "user-move-accepted",
+      alternative: true,
+    });
+    expect(alternative.snapshot.routeLineId).not.toBe(
+      alternative.snapshot.scheduledLineId,
+    );
+
+    const restored = ChapterTrainer.restoreSession(
+      chapter,
+      trainer.exportSession(130),
+      1_000,
+    );
+    expect(restored.getSnapshot()).toEqual(alternative.snapshot);
+    expect(restored.submitUserMove("g1f3", 1_010).snapshot).toMatchObject({
+      status: "line-complete",
+      initialRemaining: 1,
+    });
+  });
+
+  it("restores idle and completed sessions after an earlier alternative", () => {
+    const chapter = makeChapter("1. e4 (1. d4 d5) e5 *");
+    let trainer = new ChapterTrainer(chapter);
+
+    expect(
+      ChapterTrainer.restoreSession(chapter, trainer.exportSession(10), 100)
+        .getSnapshot(),
+    ).toEqual(trainer.getSnapshot());
+
+    trainer.start(110);
+    trainer.submitUserMove("d2d4", 120);
+    trainer.continue(130);
+    trainer.submitUserMove("e2e4", 140);
+    trainer.continue(150);
+
+    expect(trainer.getSnapshot()).toMatchObject({
+      phase: "complete",
+      status: "complete",
+    });
+    const restored = ChapterTrainer.restoreSession(
+      chapter,
+      JSON.stringify(trainer.exportSession(160)),
+      1_000,
+    );
+    expect(restored.getSnapshot()).toEqual(trainer.getSnapshot());
+    expect(restored.getAttempts()).toEqual(trainer.getAttempts());
+    expect(restored.getSessionCardGrades()).toEqual(
+      trainer.getSessionCardGrades(),
+    );
+  });
+
+  it("rejects mismatched, stale, unsupported, and corrupt checkpoints", () => {
+    const chapter = makeChapter("1. e4 e5 2. Nf3 Nc6 *");
+    const trainer = new ChapterTrainer(chapter);
+    trainer.start(100);
+    const checkpoint = trainer.exportSession(110);
+
+    const otherChapter = structuredClone(chapter);
+    otherChapter.id = "another-chapter";
+    expectRestoreError(
+      () => ChapterTrainer.restoreSession(otherChapter, checkpoint),
+      "CHAPTER_MISMATCH",
+    );
+
+    const structurallyChanged = structuredClone(chapter);
+    const firstMove = structurallyChanged.moves[
+      structurallyChanged.lines[0].moveIds[0]
+    ];
+    firstMove.uci = "d2d4";
+    expectRestoreError(
+      () => ChapterTrainer.restoreSession(structurallyChanged, checkpoint),
+      "STALE_CHAPTER",
+    );
+
+    expectRestoreError(
+      () => ChapterTrainer.restoreSession(chapter, { ...checkpoint, version: 2 }),
+      "UNSUPPORTED_VERSION",
+    );
+
+    const corrupt = structuredClone(checkpoint);
+    corrupt.state.currentNodeId = "missing-node";
+    expectRestoreError(
+      () => ChapterTrainer.restoreSession(chapter, corrupt),
+      "INVALID_SNAPSHOT",
+    );
+    expectRestoreError(
+      () => ChapterTrainer.restoreSession(chapter, "{not json"),
+      "INVALID_SNAPSHOT",
+    );
   });
 });

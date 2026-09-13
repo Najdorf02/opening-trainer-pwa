@@ -17,11 +17,17 @@ import { LichessClient } from '../server/lichess';
 import { OpeningPracticeClient } from '../server/opening-practice';
 import { StudyStorage } from '../server/storage';
 import { StudySyncService } from '../server/sync';
+import {
+  desktopOrigin,
+  desktopPortCandidates,
+  persistDesktopOriginPort,
+  PREFERRED_DESKTOP_PORT,
+  DESKTOP_PORT_ATTEMPTS,
+  readDesktopOriginPort,
+} from './origin-state';
 
 const APP_NAME = 'Opening Trainer';
 const APP_ID = 'com.saturdaycthuns.openingtrainer';
-const PREFERRED_PORT = 5173;
-const PORT_ATTEMPTS = 40;
 const SMOKE_TEST = process.argv.includes('--smoke-test');
 
 interface DesktopRuntime {
@@ -88,15 +94,15 @@ async function startLocalServer(): Promise<DesktopRuntime> {
   await assertWebBuild(webRoot);
 
   const dataDir = path.join(electronApp.getPath('userData'), 'data');
+  const persistedPort = await readDesktopOriginPort(dataDir);
   let lastPortError: unknown;
 
-  for (let offset = 0; offset < PORT_ATTEMPTS; offset += 1) {
-    const port = PREFERRED_PORT + offset;
+  for (const port of desktopPortCandidates(persistedPort)) {
     const config = loadConfig({
       ...process.env,
       NODE_ENV: 'production',
       PORT: String(port),
-      OPENING_TRAINER_ORIGIN: `http://127.0.0.1:${port}`,
+      OPENING_TRAINER_ORIGIN: desktopOrigin(port),
       OPENING_TRAINER_DATA_DIR: dataDir,
     });
 
@@ -115,15 +121,27 @@ async function startLocalServer(): Promise<DesktopRuntime> {
 
     try {
       const server = await listen(localApp, config);
+      try {
+        await persistDesktopOriginPort(dataDir, port);
+      } catch (error) {
+        await closeServer(server);
+        throw error;
+      }
       return { config, server, webRoot };
     } catch (error) {
       if (!isAddressInUse(error)) throw error;
       lastPortError = error;
+      if (persistedPort !== undefined) {
+        throw new Error(
+          `${desktopOrigin(persistedPort)}가 이미 사용 중입니다. 훈련 진도를 보존하기 위해 다른 포트로 자동 변경하지 않았습니다. 해당 포트를 사용하는 프로그램을 종료한 뒤 다시 실행해 주세요.`,
+          { cause: error },
+        );
+      }
     }
   }
 
   throw new Error(
-    `로컬 포트 ${PREFERRED_PORT}-${PREFERRED_PORT + PORT_ATTEMPTS - 1}를 사용할 수 없습니다.`,
+    `로컬 포트 ${PREFERRED_DESKTOP_PORT}-${PREFERRED_DESKTOP_PORT + DESKTOP_PORT_ATTEMPTS - 1}를 사용할 수 없습니다.`,
     { cause: lastPortError },
   );
 }
