@@ -1,6 +1,6 @@
 {
   "name": "opening-trainer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "main": "dist-electron/app/main.cjs",
@@ -17,6 +17,7 @@
     "desktop:build": "npm run build && npm run desktop:prepare && electron-builder --config electron-builder.yml --win portable --x64",
     "start": "cross-env NODE_ENV=production tsx server/index.ts",
     "test": "vitest run",
+    "test:annotation-ui": "node scripts/smoke-annotation-ui.cjs",
     "test:watch": "vitest"
   },
   "dependencies": {

@@ -14,6 +14,7 @@ import {
   type StudyAnnotationMoment,
 } from './study-annotations.js';
 import { chapterForCardReview, chapterForLineIds } from './training-chapter.js';
+import { canSubmitTrainerBoardInput } from './trainer-board-input.js';
 import {
   createTrainingState,
   loadTrainingState,
@@ -357,6 +358,7 @@ function TrainerScreen({ training, onBack, onCheckpoint, onComplete }: {
   const [wrongCount, setWrongCount] = useState(resume?.ui.wrongCount ?? 0);
   const [correctCount, setCorrectCount] = useState(resume?.ui.correctCount ?? 0);
   const completionReported = useRef(false);
+  const dragStartFen = useRef<string | null>(null);
   const repertoire = chapter.repertoire;
   const activeAnnotation = annotationMoments[0] ?? null;
   const userColor: Color = chapter.orientation === 'white' ? 'w' : 'b';
@@ -468,8 +470,14 @@ function TrainerScreen({ training, onBack, onCheckpoint, onComplete }: {
     return true;
   }, [repertoire]);
 
-  const tryMove = useCallback((from: string, to: string | null): boolean => {
-    if (activeAnnotation || !to || snapshot.status !== 'awaiting-user' || !snapshot.prompt) return false;
+  const tryMove = useCallback((from: string, to: string | null, inputFen: string): boolean => {
+    if (activeAnnotation) setAnnotationMoments([]);
+    // A study memo can show the position before an automatic opponent reply.
+    // Never score a gesture that started on that historical board.
+    if (!to || correctFeedback || !canSubmitTrainerBoardInput(snapshot, inputFen) || !snapshot.prompt) {
+      setSelected(null);
+      return false;
+    }
     const prefix = `${from}${to}`.toLowerCase();
     const promotionMove = snapshot.prompt.acceptedMoves.find((move) => move.uci.startsWith(prefix));
     const transition = trainer.submitUserMove({ from, to, promotion: promotionMove?.uci[4] });
@@ -487,27 +495,34 @@ function TrainerScreen({ training, onBack, onCheckpoint, onComplete }: {
     }
     if (transition.events.some((event) => event.type === 'illegal-move')) {
       setSelected(null);
-      // Illegal attempts change the trainer checkpoint even though the board
-      // and prompt stay put, so persist them without relying on a React render.
-      onCheckpoint(buildSavedSession());
+      // A fresh snapshot also persists the attempt and the dismissed memo queue
+      // together, even though the board and prompt themselves stay put.
+      setSnapshot(transition.snapshot);
       return false;
     }
     return applyAcceptedTransition(transition);
-  }, [activeAnnotation, applyAcceptedTransition, buildSavedSession, onCheckpoint, snapshot.prompt, snapshot.status, trainer]);
+  }, [activeAnnotation, applyAcceptedTransition, correctFeedback, snapshot, trainer]);
 
   const handleSquareClick = useCallback(({ square }: { square: string }) => {
-    if (activeAnnotation || snapshot.status !== 'awaiting-user' || correctFeedback) return;
+    if (activeAnnotation) setAnnotationMoments([]);
+    if (snapshot.status !== 'awaiting-user' || correctFeedback) {
+      setSelected(null);
+      return;
+    }
     const game = new Chess(snapshot.fen);
     const piece = game.get(square as never);
-    if (!selected) {
+    // When skipping a historical memo, start a new selection on the live board.
+    const sourceSquare = activeAnnotation ? null : selected;
+    if (!sourceSquare) {
       if (piece?.color === userColor) setSelected(square);
+      else setSelected(null);
       return;
     }
     if (piece?.color === userColor) {
       setSelected(square);
       return;
     }
-    tryMove(selected, square);
+    tryMove(sourceSquare, square, snapshot.fen);
   }, [activeAnnotation, correctFeedback, selected, snapshot.fen, snapshot.status, tryMove, userColor]);
 
   const handleContinueAnnotation = useCallback(() => {
@@ -568,7 +583,7 @@ function TrainerScreen({ training, onBack, onCheckpoint, onComplete }: {
     );
   }
 
-  const canMove = snapshot.status === 'awaiting-user' && !correctFeedback && !activeAnnotation;
+  const canMove = snapshot.status === 'awaiting-user' && !correctFeedback;
   const boardOptions = {
     id: `trainer-${chapter.id}`,
     position: displayFen,
@@ -586,7 +601,17 @@ function TrainerScreen({ training, onBack, onCheckpoint, onComplete }: {
       if (!square || !canMove) return false;
       return new Chess(displayFen).get(square as never)?.color === userColor;
     },
-    onPieceDrop: ({ sourceSquare, targetSquare }: { sourceSquare: string; targetSquare: string | null }) => tryMove(sourceSquare, targetSquare),
+    onPieceDrag: () => {
+      dragStartFen.current = displayFen;
+      setSelected(null);
+      if (activeAnnotation) setAnnotationMoments([]);
+    },
+    onPieceDragCancel: () => { dragStartFen.current = null; },
+    onPieceDrop: ({ sourceSquare, targetSquare }: { sourceSquare: string; targetSquare: string | null }) => {
+      const inputFen = dragStartFen.current ?? displayFen;
+      dragStartFen.current = null;
+      return tryMove(sourceSquare, targetSquare, inputFen);
+    },
     onSquareClick: handleSquareClick,
   } as const;
 
@@ -609,6 +634,11 @@ function TrainerScreen({ training, onBack, onCheckpoint, onComplete }: {
                 <strong>리체스 연구 메모 · {activeAnnotation.san ? `${activeAnnotation.san} 뒤` : '시작 포지션'}</strong>
                 {activeAnnotation.comments.map((comment, index) => <p key={`${index}:${comment}`}>{comment}</p>)}
                 {(activeAnnotation.arrows.length > 0 || activeAnnotation.squares.length > 0) && <small>연구에 표시한 화살표와 강조 칸을 보드에 표시했습니다.</small>}
+                <small>{snapshot.status !== 'awaiting-user'
+                  ? '체스판을 누르면 메모를 건너뛰고 훈련을 계속합니다.'
+                  : activeAnnotation.fen === snapshot.fen
+                  ? '확인 없이 기물을 움직이면 메모를 건너뛰고 계속 훈련합니다.'
+                  : '체스판을 누르거나 기물을 드래그하면 메모를 건너뛰고 현재 차례로 돌아갑니다.'}</small>
               </div>
               <button className="study-note-button" type="button" onClick={handleContinueAnnotation}>
                 {annotationMoments.length > 1 ? '다음 메모' : '계속'} <Icon name="arrow" size={15} />
